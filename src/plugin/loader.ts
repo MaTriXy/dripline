@@ -22,6 +22,7 @@ export async function loadBuiltinPlugins(): Promise<void> {
   const files = readdirSync(dirPath).filter(
     (f) =>
       (f.endsWith(".ts") || f.endsWith(".js")) &&
+      !f.endsWith(".d.ts") &&
       !f.endsWith(".test.ts") &&
       !f.startsWith("_"),
   );
@@ -49,7 +50,7 @@ async function loadFromDirectory(dir: string): Promise<PluginDef[]> {
     const fullPath = join(dir, entry);
     const stat = statSync(fullPath);
 
-    if (stat.isFile() && (entry.endsWith(".ts") || entry.endsWith(".js")) && !entry.endsWith(".test.ts")) {
+    if (stat.isFile() && (entry.endsWith(".ts") || entry.endsWith(".js")) && !entry.endsWith(".d.ts") && !entry.endsWith(".test.ts")) {
       try {
         plugins.push(await loadPluginFromPath(fullPath));
       } catch {
