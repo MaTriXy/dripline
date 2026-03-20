@@ -19,7 +19,7 @@
     "dist"
   ],
   "scripts": {
-    "postinstall": "test -L node_modules/dripline || ln -s .. node_modules/dripline",
+    "postinstall": "test -e node_modules/dripline || ln -s .. node_modules/dripline",
     "build": "tsc && npm run build --workspaces --if-present",
     "prepublishOnly": "npm run build",
     "dev": "npx tsx src/main.ts",
