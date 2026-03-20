@@ -13,10 +13,15 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: oven-sh/setup-bun@v2
-      - run: bun install
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - run: npm install
+      - run: npm run build
       - name: Run tests
-        run: bun test
+        run: npx tsx --test src/tests/**/*.test.ts
+      - name: Run plugin tests
+        run: npm test --workspaces --if-present
 
   release:
     needs: test
@@ -33,12 +38,11 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: oven-sh/setup-bun@v2
-      - run: bun install
       - uses: actions/setup-node@v4
         with:
           node-version: 22
           registry-url: https://registry.npmjs.org
+      - run: npm install
       - name: Build
         run: npm run build
       - name: Publish to npm
