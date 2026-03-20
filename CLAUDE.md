@@ -1,6 +1,6 @@
 # dripline
 
-Query anything, one drip at a time.
+Query mode for agents.
 
 ## Commands
 

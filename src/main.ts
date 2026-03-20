@@ -20,7 +20,7 @@ const program = new Command();
 
 program
   .name("dripline")
-  .description("Query anything, one drip at a time")
+  .description("Query mode for agents")
   .version(`dripline ${version}`, "-v, --version")
   .option("--json", "Output as JSON")
   .option("-q, --quiet", "Suppress output")
