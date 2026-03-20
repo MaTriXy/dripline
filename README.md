@@ -1,4 +1,4 @@
-# dripline
+# dripline 💧
 
 Query APIs using SQL. One drip at a time.
 
