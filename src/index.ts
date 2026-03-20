@@ -29,7 +29,21 @@ export {
   loadPluginFromPath,
   loadBuiltinPlugins,
   loadPluginsFromConfig,
+  loadAllPlugins,
 } from "./plugin/loader.js";
+
+// Plugin API (for writing plugins)
+export { createPluginAPI, resolvePluginExport, isPluginFunction } from "./plugin/api.js";
+export type {
+  DriplinePluginAPI,
+  PluginFunction,
+  TableDefinition,
+  SchemaField,
+} from "./plugin/api.js";
+
+// Plugin installer
+export { parsePluginSource, installPlugin, removePlugin, listInstalled } from "./plugin/installer.js";
+export type { PluginSource, InstalledPlugin } from "./plugin/installer.js";
 
 // Config
 export type { DriplineConfig, CacheConfig } from "./config/types.js";

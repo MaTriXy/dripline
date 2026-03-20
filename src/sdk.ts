@@ -3,12 +3,14 @@ import { PluginRegistry } from "./plugin/registry.js";
 import { QueryCache } from "./cache.js";
 import { RateLimiter } from "./rate-limiter.js";
 import type { PluginDef, ConnectionConfig, RateLimitConfig } from "./plugin/types.js";
+import type { PluginFunction } from "./plugin/api.js";
+import { resolvePluginExport } from "./plugin/api.js";
 import type { DriplineConfig } from "./config/types.js";
 import { DEFAULT_CONFIG } from "./config/types.js";
 
 export interface DriplineOptions {
-  /** Plugins to register */
-  plugins?: PluginDef[];
+  /** Plugins to register (function-based or static objects) */
+  plugins?: Array<PluginDef | PluginFunction>;
   /** Connection configs for API auth */
   connections?: ConnectionConfig[];
   /** Cache settings */
@@ -50,7 +52,8 @@ export class Dripline {
     });
     this.rateLimiter = new RateLimiter();
 
-    for (const plugin of options.plugins ?? []) {
+    for (const pluginOrFn of options.plugins ?? []) {
+      const plugin = resolvePluginExport(pluginOrFn, "unknown");
       this.registry.register(plugin);
     }
 
@@ -74,7 +77,8 @@ export class Dripline {
   }
 
   /** Register an additional plugin after construction. Re-initializes the engine. */
-  addPlugin(plugin: PluginDef, connections?: ConnectionConfig[]): void {
+  addPlugin(pluginOrFn: PluginDef | PluginFunction, connections?: ConnectionConfig[]): void {
+    const plugin = resolvePluginExport(pluginOrFn, "unknown");
     this.registry.register(plugin);
     // Re-create engine to pick up the new plugin's tables
     const config: DriplineConfig = {

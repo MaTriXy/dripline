@@ -6,6 +6,7 @@ import { init } from "./commands/init.js";
 import { onboard } from "./commands/onboard.js";
 import { query } from "./commands/query.js";
 import { repl } from "./commands/repl.js";
+import { pluginInstall, pluginRemove, pluginList } from "./commands/plugin.js";
 
 const require = createRequire(import.meta.url);
 const { version } = require("../package.json");
@@ -54,6 +55,33 @@ program
   .description("Start interactive SQL shell")
   .action(async () => {
     await repl();
+  });
+
+const pluginCmd = program.command("plugin").description("Manage plugins");
+
+pluginCmd
+  .command("install <source>")
+  .description("Install a plugin (npm:pkg, git:repo, or local path)")
+  .option("-g, --global", "Install globally")
+  .action(async (source, opts, cmd) => {
+    const globals = cmd.optsWithGlobals();
+    await pluginInstall(source, { global: opts.global, json: globals.json });
+  });
+
+pluginCmd
+  .command("remove <name>")
+  .description("Remove an installed plugin")
+  .action(async (name, _opts, cmd) => {
+    const globals = cmd.optsWithGlobals();
+    await pluginRemove(name, { json: globals.json });
+  });
+
+pluginCmd
+  .command("list")
+  .description("List all plugins")
+  .action(async (_opts, cmd) => {
+    const globals = cmd.optsWithGlobals();
+    await pluginList({ json: globals.json });
   });
 
 // Default to REPL when no command given

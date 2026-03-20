@@ -87,17 +87,20 @@ GROUP BY r.name;
 
 ## Writing a Plugin
 
-Create a file in `src/plugins/`:
+Plugins use a function-based API inspired by pi's extensions:
 
 ```typescript
-import type { PluginDef } from "../plugin/types.js";
-import { syncGetPaginated } from "./utils/http.js";
+import type { DriplinePluginAPI } from "dripline";
+import { syncGetPaginated } from "dripline/plugins/utils/http";
 
-const myPlugin: PluginDef = {
-  name: "myplugin",
-  version: "0.1.0",
-  tables: [{
-    name: "my_table",
+export default function(dl: DriplinePluginAPI) {
+  dl.setName("myplugin");
+  dl.setVersion("0.1.0");
+  dl.setConnectionSchema({
+    api_key: { type: "string", required: true, description: "API key" },
+  });
+
+  dl.registerTable("my_table", {
     columns: [
       { name: "id", type: "number" },
       { name: "name", type: "string" },
@@ -108,23 +111,34 @@ const myPlugin: PluginDef = {
     *list(ctx) {
       const org = ctx.quals.find(q => q.column === "org")?.value;
       if (!org) return;
-      const data = syncGetPaginated(`https://api.example.com/${org}/items`);
+      const headers = { Authorization: `Bearer ${ctx.connection.config.api_key}` };
+      const data = syncGetPaginated(`https://api.example.com/${org}/items`, headers);
       for (const item of data) {
         yield { id: item.id, name: item.name };
       }
     },
-  }],
-};
+  });
+}
+```
 
-export default myPlugin;
+### Installing Plugins
+
+```bash
+dripline plugin install npm:@dripline/aws       # from npm
+dripline plugin install git:github.com/user/repo # from git
+dripline plugin install ./my-plugin.ts           # local file
+dripline plugin list                             # show all plugins
+dripline plugin remove my-plugin                 # uninstall
 ```
 
 Key concepts:
+- **Plugin function** receives `DriplinePluginAPI` — register tables, set config schema
 - **Columns** define what users can SELECT
 - **Key columns** become required/optional WHERE parameters — pushed down to the API
 - **`list`** is a sync generator that yields rows
 - **`get`** (optional) handles single-item lookups
 - HTTP calls use `execFileSync("curl", ...)` — sync is required by SQLite
+- Plugins auto-discovered from `.dripline/plugins/` (project) and `~/.dripline/plugins/` (global)
 
 ## Configuration
 

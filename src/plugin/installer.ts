@@ -1,0 +1,217 @@
+import { execSync } from "node:child_process";
+import {
+  existsSync,
+  mkdirSync,
+  readFileSync,
+  writeFileSync,
+  rmSync,
+} from "node:fs";
+import { join, resolve, basename } from "node:path";
+import { homedir } from "node:os";
+import { findConfigDir } from "../config/loader.js";
+
+export interface PluginSource {
+  type: "npm" | "git" | "local";
+  name: string;
+  ref?: string;
+  url?: string;
+  path?: string;
+}
+
+export interface InstalledPlugin {
+  source: string;
+  path: string;
+  name?: string;
+}
+
+const PLUGINS_FILE = "plugins.json";
+
+export function parsePluginSource(source: string): PluginSource {
+  // npm:@scope/pkg@version or npm:pkg
+  if (source.startsWith("npm:")) {
+    const rest = source.slice(4);
+    // Handle @scope/pkg@version
+    let name: string;
+    let ref: string | undefined;
+    if (rest.startsWith("@")) {
+      // Scoped: @scope/pkg@version
+      const lastAt = rest.lastIndexOf("@");
+      if (lastAt > 0 && lastAt !== rest.indexOf("@")) {
+        name = rest.slice(0, lastAt);
+        ref = rest.slice(lastAt + 1);
+      } else {
+        name = rest;
+      }
+    } else {
+      const atIdx = rest.indexOf("@");
+      if (atIdx > 0) {
+        name = rest.slice(0, atIdx);
+        ref = rest.slice(atIdx + 1);
+      } else {
+        name = rest;
+      }
+    }
+    return { type: "npm", name, ref };
+  }
+
+  // git:github.com/user/repo@ref or https://...
+  if (
+    source.startsWith("git:") ||
+    source.startsWith("https://") ||
+    source.startsWith("http://") ||
+    source.startsWith("ssh://")
+  ) {
+    let raw = source;
+    if (raw.startsWith("git:")) raw = raw.slice(4);
+
+    let ref: string | undefined;
+    const atIdx = raw.lastIndexOf("@");
+    if (atIdx > 0 && !raw.slice(atIdx).includes("/")) {
+      ref = raw.slice(atIdx + 1);
+      raw = raw.slice(0, atIdx);
+    }
+
+    // Normalize to https URL
+    let url = raw;
+    if (!url.startsWith("http://") && !url.startsWith("https://") && !url.startsWith("ssh://")) {
+      url = `https://${url}`;
+    }
+    if (!url.endsWith(".git")) url += ".git";
+
+    const name = basename(url, ".git");
+    return { type: "git", name, url, ref };
+  }
+
+  // Local path
+  const absPath = resolve(source);
+  const name = basename(absPath).replace(/\.(ts|js)$/, "");
+  return { type: "local", name, path: absPath };
+}
+
+function getPluginsDir(global: boolean): string {
+  if (global) {
+    const dir = join(homedir(), ".dripline", "plugins");
+    mkdirSync(dir, { recursive: true });
+    return dir;
+  }
+  const configDir = findConfigDir();
+  const dir = configDir
+    ? join(configDir, "..", ".dripline", "plugins")
+    : join(process.cwd(), ".dripline", "plugins");
+  mkdirSync(dir, { recursive: true });
+  return dir;
+}
+
+function getPluginsJsonPath(): string {
+  const configDir = findConfigDir();
+  return configDir
+    ? join(configDir, PLUGINS_FILE)
+    : join(process.cwd(), ".dripline", PLUGINS_FILE);
+}
+
+function readPluginsJson(): { plugins: InstalledPlugin[] } {
+  const path = getPluginsJsonPath();
+  if (!existsSync(path)) return { plugins: [] };
+  return JSON.parse(readFileSync(path, "utf-8"));
+}
+
+function writePluginsJson(data: { plugins: InstalledPlugin[] }): void {
+  const path = getPluginsJsonPath();
+  mkdirSync(join(path, ".."), { recursive: true });
+  writeFileSync(path, `${JSON.stringify(data, null, 2)}\n`);
+}
+
+export async function installPlugin(
+  source: string,
+  options?: { global?: boolean },
+): Promise<{ path: string; name: string }> {
+  const parsed = parsePluginSource(source);
+  const pluginsDir = getPluginsDir(options?.global ?? false);
+
+  let installPath: string;
+
+  switch (parsed.type) {
+    case "npm": {
+      const npmDir = join(pluginsDir, "npm");
+      mkdirSync(npmDir, { recursive: true });
+      const spec = parsed.ref ? `${parsed.name}@${parsed.ref}` : parsed.name;
+      execSync(`npm install ${spec}`, { cwd: npmDir, stdio: "pipe" });
+      installPath = join(npmDir, "node_modules", parsed.name);
+      break;
+    }
+    case "git": {
+      const url = new URL(parsed.url!);
+      const gitDir = join(pluginsDir, "git", url.hostname, url.pathname.replace(/\.git$/, ""));
+      if (existsSync(gitDir)) {
+        execSync("git pull", { cwd: gitDir, stdio: "pipe" });
+      } else {
+        mkdirSync(join(gitDir, ".."), { recursive: true });
+        const refArg = parsed.ref ? `--branch ${parsed.ref}` : "";
+        execSync(`git clone ${refArg} ${parsed.url} ${gitDir}`, { stdio: "pipe" });
+      }
+      if (existsSync(join(gitDir, "package.json"))) {
+        execSync("npm install", { cwd: gitDir, stdio: "pipe" });
+      }
+      installPath = gitDir;
+      break;
+    }
+    case "local": {
+      if (!existsSync(parsed.path!)) {
+        throw new Error(`Path does not exist: ${parsed.path}`);
+      }
+      installPath = parsed.path!;
+      break;
+    }
+  }
+
+  // Register in plugins.json
+  const data = readPluginsJson();
+  const existing = data.plugins.findIndex((p) => p.source === source);
+  const entry: InstalledPlugin = { source, path: installPath, name: parsed.name };
+  if (existing >= 0) {
+    data.plugins[existing] = entry;
+  } else {
+    data.plugins.push(entry);
+  }
+  writePluginsJson(data);
+
+  return { path: installPath, name: parsed.name };
+}
+
+export function removePlugin(name: string): boolean {
+  const data = readPluginsJson();
+  const idx = data.plugins.findIndex(
+    (p) => p.name === name || p.source.includes(name),
+  );
+  if (idx < 0) return false;
+
+  const plugin = data.plugins[idx];
+  const parsed = parsePluginSource(plugin.source);
+
+  // Remove files for npm/git installs
+  if (parsed.type !== "local" && existsSync(plugin.path)) {
+    rmSync(plugin.path, { recursive: true, force: true });
+  }
+
+  data.plugins.splice(idx, 1);
+  writePluginsJson(data);
+  return true;
+}
+
+export function listInstalled(): Array<{
+  name: string;
+  type: string;
+  source: string;
+  path: string;
+}> {
+  const data = readPluginsJson();
+  return data.plugins.map((p) => {
+    const parsed = parsePluginSource(p.source);
+    return {
+      name: p.name || parsed.name,
+      type: parsed.type,
+      source: p.source,
+      path: p.path,
+    };
+  });
+}

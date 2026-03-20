@@ -1,9 +1,12 @@
 import { describe, it } from "node:test";
 import { strict as assert } from "node:assert";
-import plugin from "../plugins/github.js";
-import type { ColumnType } from "../plugin/types.js";
+import githubFn from "../plugins/github.js";
+import { resolvePluginExport } from "../plugin/api.js";
+import type { ColumnType, PluginDef } from "../plugin/types.js";
 
 const VALID_TYPES: ColumnType[] = ["string", "number", "boolean", "json", "datetime"];
+
+const plugin: PluginDef = resolvePluginExport(githubFn, "github");
 
 function getTable(name: string) {
   return plugin.tables.find((t) => t.name === name)!;

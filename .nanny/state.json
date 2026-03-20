@@ -1,261 +1,186 @@
 {
   "version": 1,
-  "goal": "Full test coverage for every module in dripline",
+  "goal": "Refactor plugin system: function-based API (pi-inspired) + npm/git/local install",
   "maxAttempts": 3,
   "tasks": [
     {
       "id": 1,
-      "description": "Create src/tests/cache.test.ts — unit tests for src/cache.ts (QueryCache).\n\nTest cases:\n1. constructor defaults (enabled=true, ttl=300, maxSize=1000)\n2. constructor with custom opts\n3. set + get returns data\n4. get returns null after TTL expires — use a very short TTL (e.g. 1ms), set, sleep 5ms, get should return null\n5. get returns null when cache disabled\n6. set when disabled does nothing\n7. getCacheKey is deterministic — same inputs produce same key\n8. getCacheKey sorts quals and columns — different order same key\n9. getCacheKey different quals produce different keys\n10. maxSize eviction — set maxSize=3, add 4 entries, oldest should be evicted\n11. invalidate(tableName) clears only matching entries\n12. invalidate() with no arg clears everything\n13. clear() resets everything including hit/miss counters\n14. stats() tracks hits correctly\n15. stats() tracks misses correctly\n16. stats() tracks size correctly\n17. configureCache creates a new instance\n18. get on expired entry returns null and removes it from map",
+      "description": "Create the new function-based plugin API in src/plugin/api.ts.\n\nDefine `DriplinePluginAPI` interface — the object passed to plugin functions:\n- `registerTable(name: string, def: TableDefinition): void` — register a virtual table\n- `setConnectionSchema(schema: Record<string, SchemaField>): void` — declare what config fields the plugin needs\n- `setName(name: string): void` — set plugin name (optional, defaults to filename)\n- `setVersion(version: string): void` — set version\n- `onInit(fn: (config: Record<string, any>) => void): void` — hook called when connection config is available\n- `log: { info(msg: string): void, warn(msg: string): void, error(msg: string): void }` — logging\n\nWhere `TableDefinition` is essentially the existing `TableDef` minus the name (since name is the first arg).\n\nWhere `SchemaField` is `{ type: 'string' | 'number' | 'boolean', required?: boolean, description?: string, default?: any }`\n\nDefine `PluginFunction` type: `(api: DriplinePluginAPI) => void`\n\nImplement `createPluginAPI(pluginId: string): { api: DriplinePluginAPI, resolve: () => PluginDef }` — creates the API object and a resolve function that returns the built PluginDef after the plugin function runs. Internally collects tables, schema, hooks into a PluginDef.\n\nThe old static PluginDef export should still work. Update src/plugin/loader.ts to detect whether the default export is a function or an object:\n- If function: call `createPluginAPI()`, pass api to function, call `resolve()` to get PluginDef\n- If object with `name` and `tables`: use as-is (backward compat)\n\nExport everything from src/plugin/index.ts.",
       "check": {
-        "command": "npx tsx --test src/tests/cache.test.ts 2>&1"
+        "command": "npx tsx -e \"import { createPluginAPI } from './src/plugin/api.js'; const { api, resolve } = createPluginAPI('test'); api.setName('test'); api.registerTable('t', { columns: [{ name: 'id', type: 'number' }], *list() { yield { id: 1 }; } }); const p = resolve(); console.log(p.name, p.tables.length); \""
       },
       "status": "done",
       "attempts": 1,
       "maxAttempts": 3,
-      "startedAt": "2026-03-20T07:31:14.930Z",
-      "finishedAt": "2026-03-20T07:31:40.967Z",
-      "summary": "17/17 cache tests pass"
+      "startedAt": "2026-03-20T07:47:03.155Z",
+      "finishedAt": "2026-03-20T07:48:01.403Z",
+      "summary": "Plugin API created, loader updated, all tests pass"
     },
     {
       "id": 2,
-      "description": "Create src/tests/rate-limiter.test.ts — unit tests for src/rate-limiter.ts.\n\nTest cases:\n1. acquire with no configured scope passes through immediately\n2. configure sets up a bucket\n3. acquire consumes a token\n4. acquire waits when no tokens available — configure maxPerSecond=1, acquire twice rapidly, second should take ~1s (use timing assertion with tolerance)\n5. acquireSync with no configured scope passes through\n6. acquireSync consumes a token\n7. release decrements active concurrent count\n8. maxConcurrent limits parallel acquisitions\n9. tokens refill over time — acquire all tokens, wait, tokens should be available again\n10. maxPerMinute configuration works (converted to per-second rate)\n11. multiple scopes are independent — configure 'a' and 'b' separately, exhausting 'a' doesn't affect 'b'",
+      "description": "Convert the GitHub plugin (src/plugins/github.ts) to use the new function-based API.\n\nChange from:\n```\nconst github: PluginDef = { name: 'github', ... };\nexport default github;\n```\n\nTo:\n```\nimport type { DriplinePluginAPI } from '../plugin/api.js';\n\nexport default function(dl: DriplinePluginAPI) {\n  dl.setName('github');\n  dl.setVersion('0.1.0');\n  dl.setConnectionSchema({ token: { type: 'string', required: false, description: 'GitHub PAT' } });\n\n  // Shared auth header builder\n  function authHeaders(config: Record<string, any>) { ... }\n\n  dl.registerTable('github_repos', { ... });\n  dl.registerTable('github_issues', { ... });\n  dl.registerTable('github_pull_requests', { ... });\n  dl.registerTable('github_stargazers', { ... });\n}\n```\n\nThe key benefit: shared helper functions (authHeaders, getQual) are naturally scoped inside the plugin function closure. Connection config access is cleaner.\n\nAll existing behavior must be preserved. All existing tests must still pass.",
       "check": {
-        "command": "npx tsx --test src/tests/rate-limiter.test.ts 2>&1"
+        "command": "npx tsx -e \"import plugin from './src/plugins/github.js'; console.log(typeof plugin)\" && npm test 2>&1 | tail -5"
       },
       "status": "done",
       "attempts": 1,
       "maxAttempts": 3,
-      "startedAt": "2026-03-20T07:31:40.998Z",
-      "finishedAt": "2026-03-20T07:32:05.437Z",
-      "summary": "11/11 rate limiter tests pass"
+      "startedAt": "2026-03-20T07:48:01.433Z",
+      "finishedAt": "2026-03-20T07:48:51.713Z",
+      "summary": "GitHub plugin converted to function-based, all 187 tests pass"
     },
     {
       "id": 3,
-      "description": "Create src/tests/registry.test.ts — unit tests for src/plugin/registry.ts (PluginRegistry).\n\nTest cases:\n1. register adds a plugin\n2. getPlugin returns registered plugin\n3. getPlugin returns undefined for unknown\n4. register overwrites existing plugin with same name\n5. getTable returns correct table from correct plugin\n6. getTable returns undefined for unknown plugin\n7. getTable returns undefined for unknown table in known plugin\n8. getAllTables returns flat list across all plugins\n9. getAllTables returns empty array when no plugins\n10. listPlugins returns all registered plugins\n11. listPlugins returns empty array when none registered\n12. multiple plugins with multiple tables all accessible",
+      "description": "Create the plugin installer in src/plugin/installer.ts. This handles `dripline install` and `dripline remove` for npm, git, and local plugins.\n\nImplement:\n\n`parsePluginSource(source: string): { type: 'npm' | 'git' | 'local', name: string, ref?: string, url?: string, path?: string }` — parse install source strings:\n- `npm:@dripline/github@1.0.0` → { type: 'npm', name: '@dripline/github', ref: '1.0.0' }\n- `npm:dripline-plugin-aws` → { type: 'npm', name: 'dripline-plugin-aws' }\n- `git:github.com/user/repo@v1` → { type: 'git', url: 'https://github.com/user/repo.git', ref: 'v1' }\n- `https://github.com/user/repo` → { type: 'git', url: 'https://github.com/user/repo.git' }\n- `./path/to/plugin` → { type: 'local', path: resolved absolute path }\n- `/absolute/path` → { type: 'local', path: '/absolute/path' }\n\n`installPlugin(source: string, options?: { global?: boolean }): Promise<{ path: string, name: string }>` — install a plugin:\n- npm: run `npm install <name>@<ref>` in the plugins dir. For global: `~/.dripline/plugins/npm/`. For project: `.dripline/plugins/npm/`.\n- git: `git clone <url>` into plugins dir. For global: `~/.dripline/plugins/git/<host>/<path>/`. Run `npm install` if package.json exists.\n- local: just validate the path exists, add to config.\n\n`removePlugin(name: string): boolean` — remove from installed list and delete files.\n\n`listInstalled(): Array<{ name: string, type: string, version?: string, path: string }>` — read installed plugins from `.dripline/plugins.json`.\n\nThe plugins.json format:\n```json\n{\n  \"plugins\": [\n    { \"source\": \"npm:@dripline/github@1.0.0\", \"path\": \"./plugins/npm/@dripline/github\" },\n    { \"source\": \"git:github.com/user/repo\", \"path\": \"./plugins/git/github.com/user/repo\" },\n    { \"source\": \"./my-plugin.ts\", \"path\": \"/abs/path/my-plugin.ts\" }\n  ]\n}\n```\n\nUse execSync for npm/git commands. Handle errors gracefully.",
       "check": {
-        "command": "npx tsx --test src/tests/registry.test.ts 2>&1"
+        "command": "npx tsx -e \"import { parsePluginSource } from './src/plugin/installer.js'; console.log(parsePluginSource('npm:@dripline/github@1.0.0')); console.log(parsePluginSource('git:github.com/user/repo@v1')); console.log(parsePluginSource('./test.ts'));\""
       },
       "status": "done",
       "attempts": 1,
       "maxAttempts": 3,
-      "startedAt": "2026-03-20T07:32:05.467Z",
-      "finishedAt": "2026-03-20T07:32:25.173Z",
-      "summary": "12/12 registry tests pass"
+      "startedAt": "2026-03-20T07:48:51.744Z",
+      "finishedAt": "2026-03-20T07:49:29.804Z",
+      "summary": "Plugin installer created with parse/install/remove/list"
     },
     {
       "id": 4,
-      "description": "Create src/tests/config.test.ts — unit tests for src/config/loader.ts.\n\nUse a temp directory for each test (mkdtempSync). Create .dripline/ dir and config.json as needed.\n\nTest cases:\n1. findConfigDir returns null when no .dripline/ exists\n2. findConfigDir finds .dripline/ in current dir\n3. findConfigDir walks up parent dirs to find .dripline/\n4. loadConfig returns defaults when no config file\n5. loadConfig reads and parses config.json\n6. loadConfig merges with defaults (missing fields get defaults)\n7. saveConfig creates config.json\n8. saveConfig overwrites existing config.json\n9. getConnection returns matching connection\n10. getConnection returns undefined for unknown\n11. addConnection adds new connection\n12. addConnection updates existing connection by name\n13. removeConnection removes and returns true\n14. removeConnection returns false for unknown\n15. DEFAULT_CONFIG has expected values\n\nUse process.chdir() to temp dirs, restore in afterEach. Or mock findConfigDir.",
+      "description": "Update src/plugin/loader.ts to support auto-discovery from conventional directories + installed plugins.\n\nAuto-discovery locations (in order):\n1. Built-in: `src/plugins/` (already works)\n2. Project-local: `.dripline/plugins/*.ts`, `.dripline/plugins/*/index.ts`\n3. Global: `~/.dripline/plugins/*.ts`, `~/.dripline/plugins/*/index.ts`\n4. Installed npm: `.dripline/plugins/npm/*/`, check package.json for `dripline.plugins` paths\n5. Installed git: `.dripline/plugins/git/*/`, check package.json\n\nUpdate `loadPluginFromPath(path: string)` to handle both function and static exports:\n- If default export is a function → create API, call it, resolve to PluginDef\n- If default export has .name and .tables → use as PluginDef directly\n- If neither → throw with helpful error\n\nUpdate `loadBuiltinPlugins()` — already loads from src/plugins/, keep as-is.\n\nAdd `loadAllPlugins(): Promise<void>` — loads from ALL sources (builtin + project + global + installed). Deduplicates by plugin name (project-local wins over global).\n\nUpdate `loadPluginsFromConfig()` to read the new plugins.json format.\n\nExport from src/plugin/index.ts.",
       "check": {
-        "command": "npx tsx --test src/tests/config.test.ts 2>&1"
+        "command": "npx tsx -e \"import { loadAllPlugins } from './src/plugin/loader.js'; import { registry } from './src/plugin/registry.js'; loadAllPlugins().then(() => console.log('loaded:', registry.listPlugins().map(p => p.name)));\""
       },
       "status": "done",
       "attempts": 1,
       "maxAttempts": 3,
-      "startedAt": "2026-03-20T07:32:25.204Z",
-      "finishedAt": "2026-03-20T07:33:04.402Z",
-      "summary": "15/15 config tests pass"
+      "startedAt": "2026-03-20T07:49:29.834Z",
+      "finishedAt": "2026-03-20T07:50:10.860Z",
+      "summary": "Loader updated with loadAllPlugins, auto-discovery, 187 tests pass"
     },
     {
       "id": 5,
-      "description": "Create src/tests/formatters.test.ts — unit tests for src/utils/formatters.ts and src/utils/table-formatter.ts.\n\nTable formatter tests:\n1. formatTable with empty array returns 'No results.'\n2. formatTable with one row renders correctly (has borders, header, data)\n3. formatTable with multiple rows\n4. formatTable handles null values — displays '<null>'\n5. formatTable handles boolean values\n6. formatTable handles long strings — truncates with '…'\n7. formatTable shows row count at bottom\n8. formatTable with custom maxWidth\n\nJSON formatter tests:\n9. formatJson returns pretty-printed JSON array\n10. formatJson with empty array returns '[]'\n11. formatJson with nested objects\n\nCSV formatter tests:\n12. formatCsv returns header + data rows\n13. formatCsv with empty array returns ''\n14. formatCsv escapes fields with commas\n15. formatCsv escapes fields with quotes (doubles them)\n16. formatCsv escapes fields with newlines\n17. formatCsv handles null/undefined as empty string\n\nLine formatter tests:\n18. formatLine with empty array returns 'No results.'\n19. formatLine formats one record per block\n20. formatLine separates records with blank line\n21. formatLine handles null values as '<null>'\n22. formatLine pads column names to align",
+      "description": "Create CLI commands for plugin management: `dripline plugin install`, `dripline plugin remove`, `dripline plugin list`.\n\nCreate src/commands/plugin.ts with three subcommands:\n\n1. `dripline plugin install <source>` — calls installPlugin(), then loadPluginFromPath() to verify it loads, registers in plugins.json\n   - `--global` flag to install globally\n   - On success: `✓ Installed @dripline/github (4 tables)`\n   - On error: `✗ Failed to install: <error>`\n\n2. `dripline plugin remove <name>` — calls removePlugin()\n   - `✓ Removed @dripline/github`\n\n3. `dripline plugin list` — calls listInstalled() + lists builtin plugins\n   - Shows: name, version, source, table count\n   - `--json` flag for JSON output\n\nRegister in src/main.ts as a Commander subcommand group:\n```\nconst pluginCmd = program.command('plugin').description('Manage plugins');\npluginCmd.command('install <source>').option('-g, --global', 'Install globally').action(...);\npluginCmd.command('remove <name>').action(...);\npluginCmd.command('list').action(...);\n```",
       "check": {
-        "command": "npx tsx --test src/tests/formatters.test.ts 2>&1"
+        "command": "npx tsx src/main.ts plugin list 2>&1"
       },
       "status": "done",
       "attempts": 1,
       "maxAttempts": 3,
-      "startedAt": "2026-03-20T07:33:04.432Z",
-      "finishedAt": "2026-03-20T07:33:28.531Z",
-      "summary": "22/22 formatter tests pass"
+      "startedAt": "2026-03-20T07:50:10.892Z",
+      "finishedAt": "2026-03-20T07:50:45.480Z",
+      "summary": "Plugin CLI commands created"
     },
     {
       "id": 6,
-      "description": "Create src/tests/engine.test.ts — unit tests for src/engine.ts (QueryEngine). Use mock plugins, no real API calls.\n\nTest cases:\n1. query returns results from virtual table\n2. key columns are pushed down as parameters\n3. non-key WHERE clauses are filtered by SQLite\n4. cache prevents second plugin call — verify list is called once, second query hits cache\n5. cache disabled — list is called every time\n6. rate limiter acquireSync is called per query\n7. get path used when all key columns have quals AND get returns non-null\n8. get returns null falls back to list\n9. get not used when not all key columns provided\n10. hydrate functions enrich rows\n11. hydrate only called for columns in select\n12. connection resolved from config when single connection exists\n13. connection resolved by _connection parameter\n14. default connection used when no config\n15. query with params (prepared statement)\n16. close() closes the database\n17. multiple tables from same plugin all registered\n18. tables from different plugins all registered\n19. empty list returns no rows\n20. plugin error propagates through query",
+      "description": "Update all tests to work with the new plugin API. Add new tests for the function-based API.\n\nNew tests in src/tests/plugin-api.test.ts:\n1. createPluginAPI returns api and resolve\n2. setName sets plugin name\n3. setVersion sets version\n4. registerTable adds a table\n5. setConnectionSchema sets schema\n6. resolve() returns complete PluginDef\n7. multiple tables can be registered\n8. onInit hook is stored and accessible\n9. default name from pluginId if setName not called\n10. log methods don't throw\n\nNew tests in src/tests/installer.test.ts:\n11. parsePluginSource npm with version\n12. parsePluginSource npm without version\n13. parsePluginSource git shorthand\n14. parsePluginSource git https URL\n15. parsePluginSource local relative path\n16. parsePluginSource local absolute path\n\nUpdate existing tests:\n- github-plugin.test.ts: update to handle function export (call it, check the resolved PluginDef)\n- integration.test.ts: should still pass since mock plugins use static objects (backward compat)\n- engine.test.ts: should still pass\n- sdk.test.ts: should still pass\n\nAll 187+ existing tests must still pass.",
       "check": {
-        "command": "npx tsx --test src/tests/engine.test.ts 2>&1"
+        "command": "npm test 2>&1 | tail -10"
       },
       "status": "done",
       "attempts": 1,
       "maxAttempts": 3,
-      "startedAt": "2026-03-20T07:33:28.564Z",
-      "finishedAt": "2026-03-20T07:34:08.943Z",
-      "summary": "17/17 engine tests pass"
+      "startedAt": "2026-03-20T07:50:45.511Z",
+      "finishedAt": "2026-03-20T07:51:29.035Z",
+      "summary": "25 new tests added, 212 total, all pass"
     },
     {
       "id": 7,
-      "description": "Create src/tests/http.test.ts — unit tests for src/plugins/utils/http.ts.\n\nThese tests make REAL HTTP calls (to httpbin.org or similar), so they're integration-ish. Use a public echo API.\n\nTest cases:\n1. syncGet returns status, body, headers for a 200 response — GET https://httpbin.org/get\n2. syncGet parses JSON body automatically\n3. syncGet sends custom headers — verify via httpbin.org/headers\n4. syncGet handles 404 status code\n5. syncGet handles non-JSON response\n6. syncGetPaginated collects all pages — this is hard to test without a paginated API. Instead, test with a single-page response (no Link header) returns the data\n7. syncGetPaginated throws on HTTP error status\n\nAlternatively, if httpbin is flaky, mock curl by temporarily modifying PATH or use a known stable endpoint like api.github.com/zen.",
+      "description": "Update SDK (src/sdk.ts and src/index.ts) to support function-based plugins.\n\nUpdate Dripline class constructor to accept both:\n```typescript\nnew Dripline({\n  plugins: [\n    githubPlugin,                    // function-based\n    { name: 'x', tables: [...] },    // static object (backward compat)\n  ],\n});\n```\n\nInternally, detect if plugin is a function → run through createPluginAPI → resolve to PluginDef.\n\nUpdate src/index.ts exports:\n- Export DriplinePluginAPI type\n- Export createPluginAPI\n- Export parsePluginSource\n- Export SchemaField type\n- Export PluginFunction type\n\nUpdate README.md plugin authoring section to show the new function-based style.\nUpdate CLAUDE.md plugin docs.",
       "check": {
-        "command": "npx tsx --test src/tests/http.test.ts 2>&1"
+        "command": "npx tsx -e \"import { Dripline, githubPlugin } from './src/index.js'; const dl = new Dripline({ plugins: [githubPlugin] }); console.log('tables:', dl.tables().length); dl.close();\""
       },
       "status": "done",
       "attempts": 1,
       "maxAttempts": 3,
-      "startedAt": "2026-03-20T07:34:08.973Z",
-      "finishedAt": "2026-03-20T07:34:35.894Z",
-      "summary": "7/7 http tests pass"
-    },
-    {
-      "id": 8,
-      "description": "Create src/tests/store.test.ts — unit tests for src/store.ts.\n\nUse a temp directory for each test.\n\nTest cases:\n1. findRoot returns null when no .dripline dir exists\n2. findRoot finds .dripline in current dir\n3. findRoot walks up parent directories\n4. initStore creates .dripline/ and collection dirs\n5. initStore is idempotent — calling twice doesn't error\n6. newId returns 8-char string\n7. newId returns unique values\n8. writeRecord creates a JSON file\n9. readOne returns written record\n10. readOne returns null for non-existent id\n11. readAll returns all records in collection\n12. readAll returns empty array for non-existent collection\n13. deleteRecord removes file and returns true\n14. deleteRecord returns false for non-existent id\n15. writeRecord overwrites existing record",
-      "check": {
-        "command": "npx tsx --test src/tests/store.test.ts 2>&1"
-      },
-      "status": "done",
-      "attempts": 1,
-      "maxAttempts": 3,
-      "startedAt": "2026-03-20T07:34:35.925Z",
-      "finishedAt": "2026-03-20T07:34:57.641Z",
-      "summary": "15/15 store tests pass"
-    },
-    {
-      "id": 9,
-      "description": "Create src/tests/github-plugin.test.ts — unit tests for the GitHub plugin definition (src/plugins/github.ts). Do NOT make real API calls. Instead, test the plugin structure and type correctness.\n\nTest cases:\n1. plugin has name 'github'\n2. plugin has version\n3. plugin has 4 tables\n4. plugin has connectionConfigSchema with token field\n5. github_repos table has correct columns (13 columns)\n6. github_repos table has owner as required key column\n7. github_repos has list and get functions\n8. github_issues table has owner and repo as required key columns\n9. github_issues table has issue_state as optional key column\n10. github_pull_requests table structure is correct\n11. github_stargazers table structure is correct\n12. all table list functions are generator functions\n13. all tables have description\n14. column types are valid ColumnType values\n15. github_repos list with no owner qual yields nothing (call with empty quals)",
-      "check": {
-        "command": "npx tsx --test src/tests/github-plugin.test.ts 2>&1"
-      },
-      "status": "done",
-      "attempts": 1,
-      "maxAttempts": 3,
-      "startedAt": "2026-03-20T07:34:57.672Z",
-      "finishedAt": "2026-03-20T07:35:19.677Z",
-      "summary": "15/15 github plugin tests pass"
-    },
-    {
-      "id": 10,
-      "description": "Create src/tests/commands.test.ts — tests for CLI commands (init, onboard, query). These test the actual command functions, not the CLI parsing.\n\nUse temp directories.\n\nTest cases for init:\n1. init creates .dripline/ directory\n2. init creates plugins and connections subdirs\n3. init with --json outputs JSON\n4. init is idempotent\n\nTest cases for onboard:\n5. onboard creates CLAUDE.md with instructions\n6. onboard appends to existing CLAUDE.md\n7. onboard is idempotent (marker check)\n8. onboard prefers existing CLAUDE.md over AGENTS.md\n9. onboard with --json outputs JSON\n\nTest cases for query:\n10. query executes SQL and returns results (mock plugin)\n11. query with --output json formats as JSON\n12. query with --output csv formats as CSV\n13. query with --output line formats as line\n14. query with invalid SQL shows error\n\nFor command tests, capture stdout by temporarily replacing console.log.",
-      "check": {
-        "command": "npx tsx --test src/tests/commands.test.ts 2>&1"
-      },
-      "status": "done",
-      "attempts": 1,
-      "maxAttempts": 3,
-      "startedAt": "2026-03-20T07:35:19.707Z",
-      "finishedAt": "2026-03-20T07:36:19.701Z",
-      "summary": "13/13 command tests pass"
+      "startedAt": "2026-03-20T07:51:29.066Z",
+      "finishedAt": "2026-03-20T07:52:39.522Z",
+      "summary": "SDK updated, exports added, README updated, 212 tests pass"
     }
   ],
   "log": [
     {
-      "timestamp": "2026-03-20T07:31:14.930Z",
+      "timestamp": "2026-03-20T07:47:03.155Z",
       "taskId": 1,
       "event": "start",
-      "message": "Attempt 1/3: Create src/tests/cache.test.ts — unit tests for src/cache.ts (QueryCache).\n\nTest cases:\n1. constructor defaults (enabled=true, ttl=300, maxSize=1000)\n2. constructor with custom opts\n3. set + get returns data\n4. get returns null after TTL expires — use a very short TTL (e.g. 1ms), set, sleep 5ms, get should return null\n5. get returns null when cache disabled\n6. set when disabled does nothing\n7. getCacheKey is deterministic — same inputs produce same key\n8. getCacheKey sorts quals and columns — different order same key\n9. getCacheKey different quals produce different keys\n10. maxSize eviction — set maxSize=3, add 4 entries, oldest should be evicted\n11. invalidate(tableName) clears only matching entries\n12. invalidate() with no arg clears everything\n13. clear() resets everything including hit/miss counters\n14. stats() tracks hits correctly\n15. stats() tracks misses correctly\n16. stats() tracks size correctly\n17. configureCache creates a new instance\n18. get on expired entry returns null and removes it from map"
+      "message": "Attempt 1/3: Create the new function-based plugin API in src/plugin/api.ts.\n\nDefine `DriplinePluginAPI` interface — the object passed to plugin functions:\n- `registerTable(name: string, def: TableDefinition): void` — register a virtual table\n- `setConnectionSchema(schema: Record<string, SchemaField>): void` — declare what config fields the plugin needs\n- `setName(name: string): void` — set plugin name (optional, defaults to filename)\n- `setVersion(version: string): void` — set version\n- `onInit(fn: (config: Record<string, any>) => void): void` — hook called when connection config is available\n- `log: { info(msg: string): void, warn(msg: string): void, error(msg: string): void }` — logging\n\nWhere `TableDefinition` is essentially the existing `TableDef` minus the name (since name is the first arg).\n\nWhere `SchemaField` is `{ type: 'string' | 'number' | 'boolean', required?: boolean, description?: string, default?: any }`\n\nDefine `PluginFunction` type: `(api: DriplinePluginAPI) => void`\n\nImplement `createPluginAPI(pluginId: string): { api: DriplinePluginAPI, resolve: () => PluginDef }` — creates the API object and a resolve function that returns the built PluginDef after the plugin function runs. Internally collects tables, schema, hooks into a PluginDef.\n\nThe old static PluginDef export should still work. Update src/plugin/loader.ts to detect whether the default export is a function or an object:\n- If function: call `createPluginAPI()`, pass api to function, call `resolve()` to get PluginDef\n- If object with `name` and `tables`: use as-is (backward compat)\n\nExport everything from src/plugin/index.ts."
     },
     {
-      "timestamp": "2026-03-20T07:31:40.967Z",
+      "timestamp": "2026-03-20T07:48:01.403Z",
       "taskId": 1,
       "event": "done",
-      "message": "17/17 cache tests pass"
+      "message": "Plugin API created, loader updated, all tests pass"
     },
     {
-      "timestamp": "2026-03-20T07:31:40.998Z",
+      "timestamp": "2026-03-20T07:48:01.433Z",
       "taskId": 2,
       "event": "start",
-      "message": "Attempt 1/3: Create src/tests/rate-limiter.test.ts — unit tests for src/rate-limiter.ts.\n\nTest cases:\n1. acquire with no configured scope passes through immediately\n2. configure sets up a bucket\n3. acquire consumes a token\n4. acquire waits when no tokens available — configure maxPerSecond=1, acquire twice rapidly, second should take ~1s (use timing assertion with tolerance)\n5. acquireSync with no configured scope passes through\n6. acquireSync consumes a token\n7. release decrements active concurrent count\n8. maxConcurrent limits parallel acquisitions\n9. tokens refill over time — acquire all tokens, wait, tokens should be available again\n10. maxPerMinute configuration works (converted to per-second rate)\n11. multiple scopes are independent — configure 'a' and 'b' separately, exhausting 'a' doesn't affect 'b'"
+      "message": "Attempt 1/3: Convert the GitHub plugin (src/plugins/github.ts) to use the new function-based API.\n\nChange from:\n```\nconst github: PluginDef = { name: 'github', ... };\nexport default github;\n```\n\nTo:\n```\nimport type { DriplinePluginAPI } from '../plugin/api.js';\n\nexport default function(dl: DriplinePluginAPI) {\n  dl.setName('github');\n  dl.setVersion('0.1.0');\n  dl.setConnectionSchema({ token: { type: 'string', required: false, description: 'GitHub PAT' } });\n\n  // Shared auth header builder\n  function authHeaders(config: Record<string, any>) { ... }\n\n  dl.registerTable('github_repos', { ... });\n  dl.registerTable('github_issues', { ... });\n  dl.registerTable('github_pull_requests', { ... });\n  dl.registerTable('github_stargazers', { ... });\n}\n```\n\nThe key benefit: shared helper functions (authHeaders, getQual) are naturally scoped inside the plugin function closure. Connection config access is cleaner.\n\nAll existing behavior must be preserved. All existing tests must still pass."
     },
     {
-      "timestamp": "2026-03-20T07:32:05.437Z",
+      "timestamp": "2026-03-20T07:48:51.713Z",
       "taskId": 2,
       "event": "done",
-      "message": "11/11 rate limiter tests pass"
+      "message": "GitHub plugin converted to function-based, all 187 tests pass"
     },
     {
-      "timestamp": "2026-03-20T07:32:05.467Z",
+      "timestamp": "2026-03-20T07:48:51.744Z",
       "taskId": 3,
       "event": "start",
-      "message": "Attempt 1/3: Create src/tests/registry.test.ts — unit tests for src/plugin/registry.ts (PluginRegistry).\n\nTest cases:\n1. register adds a plugin\n2. getPlugin returns registered plugin\n3. getPlugin returns undefined for unknown\n4. register overwrites existing plugin with same name\n5. getTable returns correct table from correct plugin\n6. getTable returns undefined for unknown plugin\n7. getTable returns undefined for unknown table in known plugin\n8. getAllTables returns flat list across all plugins\n9. getAllTables returns empty array when no plugins\n10. listPlugins returns all registered plugins\n11. listPlugins returns empty array when none registered\n12. multiple plugins with multiple tables all accessible"
+      "message": "Attempt 1/3: Create the plugin installer in src/plugin/installer.ts. This handles `dripline install` and `dripline remove` for npm, git, and local plugins.\n\nImplement:\n\n`parsePluginSource(source: string): { type: 'npm' | 'git' | 'local', name: string, ref?: string, url?: string, path?: string }` — parse install source strings:\n- `npm:@dripline/github@1.0.0` → { type: 'npm', name: '@dripline/github', ref: '1.0.0' }\n- `npm:dripline-plugin-aws` → { type: 'npm', name: 'dripline-plugin-aws' }\n- `git:github.com/user/repo@v1` → { type: 'git', url: 'https://github.com/user/repo.git', ref: 'v1' }\n- `https://github.com/user/repo` → { type: 'git', url: 'https://github.com/user/repo.git' }\n- `./path/to/plugin` → { type: 'local', path: resolved absolute path }\n- `/absolute/path` → { type: 'local', path: '/absolute/path' }\n\n`installPlugin(source: string, options?: { global?: boolean }): Promise<{ path: string, name: string }>` — install a plugin:\n- npm: run `npm install <name>@<ref>` in the plugins dir. For global: `~/.dripline/plugins/npm/`. For project: `.dripline/plugins/npm/`.\n- git: `git clone <url>` into plugins dir. For global: `~/.dripline/plugins/git/<host>/<path>/`. Run `npm install` if package.json exists.\n- local: just validate the path exists, add to config.\n\n`removePlugin(name: string): boolean` — remove from installed list and delete files.\n\n`listInstalled(): Array<{ name: string, type: string, version?: string, path: string }>` — read installed plugins from `.dripline/plugins.json`.\n\nThe plugins.json format:\n```json\n{\n  \"plugins\": [\n    { \"source\": \"npm:@dripline/github@1.0.0\", \"path\": \"./plugins/npm/@dripline/github\" },\n    { \"source\": \"git:github.com/user/repo\", \"path\": \"./plugins/git/github.com/user/repo\" },\n    { \"source\": \"./my-plugin.ts\", \"path\": \"/abs/path/my-plugin.ts\" }\n  ]\n}\n```\n\nUse execSync for npm/git commands. Handle errors gracefully."
     },
     {
-      "timestamp": "2026-03-20T07:32:25.173Z",
+      "timestamp": "2026-03-20T07:49:29.804Z",
       "taskId": 3,
       "event": "done",
-      "message": "12/12 registry tests pass"
+      "message": "Plugin installer created with parse/install/remove/list"
     },
     {
-      "timestamp": "2026-03-20T07:32:25.204Z",
+      "timestamp": "2026-03-20T07:49:29.834Z",
       "taskId": 4,
       "event": "start",
-      "message": "Attempt 1/3: Create src/tests/config.test.ts — unit tests for src/config/loader.ts.\n\nUse a temp directory for each test (mkdtempSync). Create .dripline/ dir and config.json as needed.\n\nTest cases:\n1. findConfigDir returns null when no .dripline/ exists\n2. findConfigDir finds .dripline/ in current dir\n3. findConfigDir walks up parent dirs to find .dripline/\n4. loadConfig returns defaults when no config file\n5. loadConfig reads and parses config.json\n6. loadConfig merges with defaults (missing fields get defaults)\n7. saveConfig creates config.json\n8. saveConfig overwrites existing config.json\n9. getConnection returns matching connection\n10. getConnection returns undefined for unknown\n11. addConnection adds new connection\n12. addConnection updates existing connection by name\n13. removeConnection removes and returns true\n14. removeConnection returns false for unknown\n15. DEFAULT_CONFIG has expected values\n\nUse process.chdir() to temp dirs, restore in afterEach. Or mock findConfigDir."
+      "message": "Attempt 1/3: Update src/plugin/loader.ts to support auto-discovery from conventional directories + installed plugins.\n\nAuto-discovery locations (in order):\n1. Built-in: `src/plugins/` (already works)\n2. Project-local: `.dripline/plugins/*.ts`, `.dripline/plugins/*/index.ts`\n3. Global: `~/.dripline/plugins/*.ts`, `~/.dripline/plugins/*/index.ts`\n4. Installed npm: `.dripline/plugins/npm/*/`, check package.json for `dripline.plugins` paths\n5. Installed git: `.dripline/plugins/git/*/`, check package.json\n\nUpdate `loadPluginFromPath(path: string)` to handle both function and static exports:\n- If default export is a function → create API, call it, resolve to PluginDef\n- If default export has .name and .tables → use as PluginDef directly\n- If neither → throw with helpful error\n\nUpdate `loadBuiltinPlugins()` — already loads from src/plugins/, keep as-is.\n\nAdd `loadAllPlugins(): Promise<void>` — loads from ALL sources (builtin + project + global + installed). Deduplicates by plugin name (project-local wins over global).\n\nUpdate `loadPluginsFromConfig()` to read the new plugins.json format.\n\nExport from src/plugin/index.ts."
     },
     {
-      "timestamp": "2026-03-20T07:33:04.402Z",
+      "timestamp": "2026-03-20T07:50:10.860Z",
       "taskId": 4,
       "event": "done",
-      "message": "15/15 config tests pass"
+      "message": "Loader updated with loadAllPlugins, auto-discovery, 187 tests pass"
     },
     {
-      "timestamp": "2026-03-20T07:33:04.432Z",
+      "timestamp": "2026-03-20T07:50:10.892Z",
       "taskId": 5,
       "event": "start",
-      "message": "Attempt 1/3: Create src/tests/formatters.test.ts — unit tests for src/utils/formatters.ts and src/utils/table-formatter.ts.\n\nTable formatter tests:\n1. formatTable with empty array returns 'No results.'\n2. formatTable with one row renders correctly (has borders, header, data)\n3. formatTable with multiple rows\n4. formatTable handles null values — displays '<null>'\n5. formatTable handles boolean values\n6. formatTable handles long strings — truncates with '…'\n7. formatTable shows row count at bottom\n8. formatTable with custom maxWidth\n\nJSON formatter tests:\n9. formatJson returns pretty-printed JSON array\n10. formatJson with empty array returns '[]'\n11. formatJson with nested objects\n\nCSV formatter tests:\n12. formatCsv returns header + data rows\n13. formatCsv with empty array returns ''\n14. formatCsv escapes fields with commas\n15. formatCsv escapes fields with quotes (doubles them)\n16. formatCsv escapes fields with newlines\n17. formatCsv handles null/undefined as empty string\n\nLine formatter tests:\n18. formatLine with empty array returns 'No results.'\n19. formatLine formats one record per block\n20. formatLine separates records with blank line\n21. formatLine handles null values as '<null>'\n22. formatLine pads column names to align"
+      "message": "Attempt 1/3: Create CLI commands for plugin management: `dripline plugin install`, `dripline plugin remove`, `dripline plugin list`.\n\nCreate src/commands/plugin.ts with three subcommands:\n\n1. `dripline plugin install <source>` — calls installPlugin(), then loadPluginFromPath() to verify it loads, registers in plugins.json\n   - `--global` flag to install globally\n   - On success: `✓ Installed @dripline/github (4 tables)`\n   - On error: `✗ Failed to install: <error>`\n\n2. `dripline plugin remove <name>` — calls removePlugin()\n   - `✓ Removed @dripline/github`\n\n3. `dripline plugin list` — calls listInstalled() + lists builtin plugins\n   - Shows: name, version, source, table count\n   - `--json` flag for JSON output\n\nRegister in src/main.ts as a Commander subcommand group:\n```\nconst pluginCmd = program.command('plugin').description('Manage plugins');\npluginCmd.command('install <source>').option('-g, --global', 'Install globally').action(...);\npluginCmd.command('remove <name>').action(...);\npluginCmd.command('list').action(...);\n```"
     },
     {
-      "timestamp": "2026-03-20T07:33:28.531Z",
+      "timestamp": "2026-03-20T07:50:45.480Z",
       "taskId": 5,
       "event": "done",
-      "message": "22/22 formatter tests pass"
+      "message": "Plugin CLI commands created"
     },
     {
-      "timestamp": "2026-03-20T07:33:28.564Z",
+      "timestamp": "2026-03-20T07:50:45.511Z",
       "taskId": 6,
       "event": "start",
-      "message": "Attempt 1/3: Create src/tests/engine.test.ts — unit tests for src/engine.ts (QueryEngine). Use mock plugins, no real API calls.\n\nTest cases:\n1. query returns results from virtual table\n2. key columns are pushed down as parameters\n3. non-key WHERE clauses are filtered by SQLite\n4. cache prevents second plugin call — verify list is called once, second query hits cache\n5. cache disabled — list is called every time\n6. rate limiter acquireSync is called per query\n7. get path used when all key columns have quals AND get returns non-null\n8. get returns null falls back to list\n9. get not used when not all key columns provided\n10. hydrate functions enrich rows\n11. hydrate only called for columns in select\n12. connection resolved from config when single connection exists\n13. connection resolved by _connection parameter\n14. default connection used when no config\n15. query with params (prepared statement)\n16. close() closes the database\n17. multiple tables from same plugin all registered\n18. tables from different plugins all registered\n19. empty list returns no rows\n20. plugin error propagates through query"
+      "message": "Attempt 1/3: Update all tests to work with the new plugin API. Add new tests for the function-based API.\n\nNew tests in src/tests/plugin-api.test.ts:\n1. createPluginAPI returns api and resolve\n2. setName sets plugin name\n3. setVersion sets version\n4. registerTable adds a table\n5. setConnectionSchema sets schema\n6. resolve() returns complete PluginDef\n7. multiple tables can be registered\n8. onInit hook is stored and accessible\n9. default name from pluginId if setName not called\n10. log methods don't throw\n\nNew tests in src/tests/installer.test.ts:\n11. parsePluginSource npm with version\n12. parsePluginSource npm without version\n13. parsePluginSource git shorthand\n14. parsePluginSource git https URL\n15. parsePluginSource local relative path\n16. parsePluginSource local absolute path\n\nUpdate existing tests:\n- github-plugin.test.ts: update to handle function export (call it, check the resolved PluginDef)\n- integration.test.ts: should still pass since mock plugins use static objects (backward compat)\n- engine.test.ts: should still pass\n- sdk.test.ts: should still pass\n\nAll 187+ existing tests must still pass."
     },
     {
-      "timestamp": "2026-03-20T07:34:08.943Z",
+      "timestamp": "2026-03-20T07:51:29.035Z",
       "taskId": 6,
       "event": "done",
-      "message": "17/17 engine tests pass"
+      "message": "25 new tests added, 212 total, all pass"
     },
     {
-      "timestamp": "2026-03-20T07:34:08.973Z",
+      "timestamp": "2026-03-20T07:51:29.066Z",
       "taskId": 7,
       "event": "start",
-      "message": "Attempt 1/3: Create src/tests/http.test.ts — unit tests for src/plugins/utils/http.ts.\n\nThese tests make REAL HTTP calls (to httpbin.org or similar), so they're integration-ish. Use a public echo API.\n\nTest cases:\n1. syncGet returns status, body, headers for a 200 response — GET https://httpbin.org/get\n2. syncGet parses JSON body automatically\n3. syncGet sends custom headers — verify via httpbin.org/headers\n4. syncGet handles 404 status code\n5. syncGet handles non-JSON response\n6. syncGetPaginated collects all pages — this is hard to test without a paginated API. Instead, test with a single-page response (no Link header) returns the data\n7. syncGetPaginated throws on HTTP error status\n\nAlternatively, if httpbin is flaky, mock curl by temporarily modifying PATH or use a known stable endpoint like api.github.com/zen."
+      "message": "Attempt 1/3: Update SDK (src/sdk.ts and src/index.ts) to support function-based plugins.\n\nUpdate Dripline class constructor to accept both:\n```typescript\nnew Dripline({\n  plugins: [\n    githubPlugin,                    // function-based\n    { name: 'x', tables: [...] },    // static object (backward compat)\n  ],\n});\n```\n\nInternally, detect if plugin is a function → run through createPluginAPI → resolve to PluginDef.\n\nUpdate src/index.ts exports:\n- Export DriplinePluginAPI type\n- Export createPluginAPI\n- Export parsePluginSource\n- Export SchemaField type\n- Export PluginFunction type\n\nUpdate README.md plugin authoring section to show the new function-based style.\nUpdate CLAUDE.md plugin docs."
     },
     {
-      "timestamp": "2026-03-20T07:34:35.894Z",
+      "timestamp": "2026-03-20T07:52:39.522Z",
       "taskId": 7,
       "event": "done",
-      "message": "7/7 http tests pass"
-    },
-    {
-      "timestamp": "2026-03-20T07:34:35.925Z",
-      "taskId": 8,
-      "event": "start",
-      "message": "Attempt 1/3: Create src/tests/store.test.ts — unit tests for src/store.ts.\n\nUse a temp directory for each test.\n\nTest cases:\n1. findRoot returns null when no .dripline dir exists\n2. findRoot finds .dripline in current dir\n3. findRoot walks up parent directories\n4. initStore creates .dripline/ and collection dirs\n5. initStore is idempotent — calling twice doesn't error\n6. newId returns 8-char string\n7. newId returns unique values\n8. writeRecord creates a JSON file\n9. readOne returns written record\n10. readOne returns null for non-existent id\n11. readAll returns all records in collection\n12. readAll returns empty array for non-existent collection\n13. deleteRecord removes file and returns true\n14. deleteRecord returns false for non-existent id\n15. writeRecord overwrites existing record"
-    },
-    {
-      "timestamp": "2026-03-20T07:34:57.641Z",
-      "taskId": 8,
-      "event": "done",
-      "message": "15/15 store tests pass"
-    },
-    {
-      "timestamp": "2026-03-20T07:34:57.672Z",
-      "taskId": 9,
-      "event": "start",
-      "message": "Attempt 1/3: Create src/tests/github-plugin.test.ts — unit tests for the GitHub plugin definition (src/plugins/github.ts). Do NOT make real API calls. Instead, test the plugin structure and type correctness.\n\nTest cases:\n1. plugin has name 'github'\n2. plugin has version\n3. plugin has 4 tables\n4. plugin has connectionConfigSchema with token field\n5. github_repos table has correct columns (13 columns)\n6. github_repos table has owner as required key column\n7. github_repos has list and get functions\n8. github_issues table has owner and repo as required key columns\n9. github_issues table has issue_state as optional key column\n10. github_pull_requests table structure is correct\n11. github_stargazers table structure is correct\n12. all table list functions are generator functions\n13. all tables have description\n14. column types are valid ColumnType values\n15. github_repos list with no owner qual yields nothing (call with empty quals)"
-    },
-    {
-      "timestamp": "2026-03-20T07:35:19.677Z",
-      "taskId": 9,
-      "event": "done",
-      "message": "15/15 github plugin tests pass"
-    },
-    {
-      "timestamp": "2026-03-20T07:35:19.707Z",
-      "taskId": 10,
-      "event": "start",
-      "message": "Attempt 1/3: Create src/tests/commands.test.ts — tests for CLI commands (init, onboard, query). These test the actual command functions, not the CLI parsing.\n\nUse temp directories.\n\nTest cases for init:\n1. init creates .dripline/ directory\n2. init creates plugins and connections subdirs\n3. init with --json outputs JSON\n4. init is idempotent\n\nTest cases for onboard:\n5. onboard creates CLAUDE.md with instructions\n6. onboard appends to existing CLAUDE.md\n7. onboard is idempotent (marker check)\n8. onboard prefers existing CLAUDE.md over AGENTS.md\n9. onboard with --json outputs JSON\n\nTest cases for query:\n10. query executes SQL and returns results (mock plugin)\n11. query with --output json formats as JSON\n12. query with --output csv formats as CSV\n13. query with --output line formats as line\n14. query with invalid SQL shows error\n\nFor command tests, capture stdout by temporarily replacing console.log."
-    },
-    {
-      "timestamp": "2026-03-20T07:36:19.701Z",
-      "taskId": 10,
-      "event": "done",
-      "message": "13/13 command tests pass"
+      "message": "SDK updated, exports added, README updated, 212 tests pass"
     }
   ],
-  "createdAt": "2026-03-20T07:30:11.528Z",
-  "updatedAt": "2026-03-20T07:36:19.701Z"
+  "createdAt": "2026-03-20T07:45:59.714Z",
+  "updatedAt": "2026-03-20T07:52:39.522Z"
 }
