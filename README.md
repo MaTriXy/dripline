@@ -118,11 +118,22 @@ export default function(dl: DriplinePluginAPI) {
 
     *list(ctx) {
       const orgId = ctx.quals.find(q => q.column === "org_id")?.value;
-      const date = ctx.quals.find(q => q.column === "created_date")?.value;
 
-      // Build API URL with filters pushed down from SQL
+      // The engine extracts ALL SQL operators from WHERE clauses:
+      // =, !=, >, <, >=, <=, IN, NOT IN, BETWEEN, IS NULL, IS NOT NULL, LIKE, ILIKE
+      // Each qual has { column, operator, value } — use the operator to build your query.
+      const dateQual = ctx.quals.find(q => q.column === "created_date");
+
       let url = `https://api.example.com/orgs/${orgId}/orders`;
-      if (date) url += `?created=${date}`;
+      if (dateQual) {
+        // dateQual.operator could be "=", ">=", "BETWEEN", etc.
+        // dateQual.value is a string for =/>=/<=, or [lower, upper] for BETWEEN
+        if (dateQual.operator === "BETWEEN") {
+          url += `?from=${dateQual.value[0]}&to=${dateQual.value[1]}`;
+        } else {
+          url += `?date_${dateQual.operator === ">=" ? "from" : "to"}=${dateQual.value}`;
+        }
+      }
 
       const headers = { Authorization: `Bearer ${ctx.connection.config.api_key}` };
       const data = syncGetPaginated(url, headers);
@@ -134,7 +145,7 @@ export default function(dl: DriplinePluginAPI) {
 }
 ```
 
-**How key columns work:** when you query `SELECT * FROM orders WHERE org_id = 'acme' AND created_date = '2026-03-01'`, the engine extracts both quals and passes them to `list()` via `ctx.quals`. The plugin uses them to filter at the source — fetching only matching rows instead of everything. Columns NOT in `keyColumns` are filtered by DuckDB after all rows are materialized. For large tables, declaring filter-friendly columns as optional key columns is the difference between milliseconds and timeouts.
+**How key columns work:** the engine uses DuckDB's own SQL parser to extract WHERE predicates on key columns and passes them to `list()` via `ctx.quals`. Each qual has `column`, `operator` (`=`, `>=`, `IN`, `BETWEEN`, `LIKE`, etc.), and `value` (a scalar, array, or null depending on the operator). The plugin uses these to filter at the source — fetching only matching rows instead of everything. Columns NOT in `keyColumns` are filtered by DuckDB after all rows are materialized. For large tables, declaring filter-friendly columns as optional key columns is the difference between milliseconds and timeouts.
 
 `syncExec` supports parsers: `json`, `jsonlines`, `csv`, `tsv`, `lines`, `kv`, `raw`.
 

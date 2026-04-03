@@ -8,6 +8,7 @@ export interface ColumnDef {
 
 export interface KeyColumn {
   name: string;
+  /** @deprecated No longer used — all operators are extracted automatically */
   operators?: string[];
   required: "required" | "optional" | "any_of";
 }

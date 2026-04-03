@@ -108,34 +108,125 @@ export class QueryEngine {
     return applyEnvOverrides(connection, schema);
   }
 
-  private extractQuals(sql: string, keyColNames: string[]): Qual[] {
+  private static readonly COMPARISON_MAP: Record<string, string> = {
+    COMPARE_EQUAL: "=",
+    COMPARE_NOTEQUAL: "!=",
+    COMPARE_GREATERTHAN: ">",
+    COMPARE_LESSTHAN: "<",
+    COMPARE_GREATERTHANOREQUALTO: ">=",
+    COMPARE_LESSTHANOREQUALTO: "<=",
+  };
+
+  private static readonly FUNCTION_MAP: Record<string, string> = {
+    "~~": "LIKE",
+    "!~~": "NOT LIKE",
+    "~~*": "ILIKE",
+    "!~~*": "NOT ILIKE",
+  };
+
+  private async extractQuals(
+    sql: string,
+    keyColNames: string[],
+  ): Promise<Qual[]> {
+    const escaped = sql.replace(/'/g, "''");
+    const result = await this.db.all(
+      `SELECT json_serialize_sql('${escaped}') as ast`,
+    );
+    const ast = JSON.parse(result[0].ast);
+    if (ast.error || !ast.statements?.[0]?.node?.where_clause) return [];
+
+    const keySet = new Set(keyColNames);
     const quals: Qual[] = [];
-    for (const col of keyColNames) {
-      const patterns: [RegExp, (m: RegExpMatchArray) => string][] = [
-        // Single-quoted strings: handle '' escaped quotes
-        [
-          new RegExp(`${col}\\s*=\\s*'((?:[^']|'')*)'`, "i"),
-          (m) => m[1].replace(/''/g, "'"),
-        ],
-        // Double-quoted strings
-        [
-          new RegExp(`${col}\\s*=\\s*"((?:[^"]|\\\\")*)"`, "i"),
-          (m) => m[1].replace(/\\\\"/g, '"'),
-        ],
-        // Numeric values
-        [
-          new RegExp(`${col}\\s*=\\s*(\\d+)`, "i"),
-          (m) => m[1],
-        ],
-      ];
-      for (const [pattern, extract] of patterns) {
-        const m = sql.match(pattern);
-        if (m) {
-          quals.push({ column: col, operator: "=", value: extract(m) });
-          break;
-        }
+
+    const extractValue = (v: any): any => {
+      if (!v) return null;
+      return v.is_null ? null : v.value;
+    };
+
+    const walk = (node: any): void => {
+      if (!node) return;
+
+      // AND/OR — recurse into children
+      if (node.class === "CONJUNCTION") {
+        for (const child of node.children ?? []) walk(child);
+        return;
       }
-    }
+
+      // NOT — recurse into child
+      if (node.type === "OPERATOR_NOT") {
+        for (const child of node.children ?? []) walk(child);
+        return;
+      }
+
+      // Simple comparisons: =, !=, >, <, >=, <=
+      if (node.class === "COMPARISON") {
+        const op = QueryEngine.COMPARISON_MAP[node.type];
+        const colName = node.left?.column_names?.[0];
+        if (op && colName && keySet.has(colName)) {
+          quals.push({
+            column: colName,
+            operator: op,
+            value: extractValue(node.right?.value),
+          });
+        }
+        return;
+      }
+
+      // BETWEEN: col BETWEEN lower AND upper
+      if (node.class === "BETWEEN") {
+        const colName = node.input?.column_names?.[0];
+        if (colName && keySet.has(colName)) {
+          quals.push({
+            column: colName,
+            operator: "BETWEEN",
+            value: [extractValue(node.lower?.value), extractValue(node.upper?.value)],
+          });
+        }
+        return;
+      }
+
+      // IN / NOT IN: first child is column, rest are values
+      if (node.type === "COMPARE_IN" || node.type === "COMPARE_NOT_IN") {
+        const colName = node.children?.[0]?.column_names?.[0];
+        if (colName && keySet.has(colName)) {
+          const values = node.children.slice(1).map((c: any) => extractValue(c.value));
+          quals.push({
+            column: colName,
+            operator: node.type === "COMPARE_IN" ? "IN" : "NOT IN",
+            value: values,
+          });
+        }
+        return;
+      }
+
+      // IS NULL / IS NOT NULL
+      if (node.type === "OPERATOR_IS_NULL" || node.type === "OPERATOR_IS_NOT_NULL") {
+        const colName = node.children?.[0]?.column_names?.[0];
+        if (colName && keySet.has(colName)) {
+          quals.push({
+            column: colName,
+            operator: node.type === "OPERATOR_IS_NULL" ? "IS NULL" : "IS NOT NULL",
+            value: null,
+          });
+        }
+        return;
+      }
+
+      // LIKE / ILIKE / NOT LIKE / NOT ILIKE
+      if (node.class === "FUNCTION" && node.function_name in QueryEngine.FUNCTION_MAP) {
+        const colName = node.children?.[0]?.column_names?.[0];
+        if (colName && keySet.has(colName)) {
+          quals.push({
+            column: colName,
+            operator: QueryEngine.FUNCTION_MAP[node.function_name],
+            value: extractValue(node.children?.[1]?.value),
+          });
+        }
+        return;
+      }
+    };
+
+    walk(ast.statements[0].node.where_clause);
     return quals;
   }
 
@@ -241,7 +332,7 @@ export class QueryEngine {
     }
 
     for (const reg of referencedTables) {
-      const quals = this.extractQuals(sql, reg.keyColNames);
+      const quals = await this.extractQuals(sql, reg.keyColNames);
       await this.populateTable(reg, quals);
     }
 

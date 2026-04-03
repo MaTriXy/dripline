@@ -120,6 +120,93 @@ describe("QueryEngine", () => {
     );
   });
 
+  it("extracts >= operator", async () => {
+    await setup();
+    await engine.query("SELECT * FROM users WHERE role >= 'admin'");
+    assert.ok(lastCtx);
+    assert.equal(lastCtx.quals[0].operator, ">=");
+    assert.equal(lastCtx.quals[0].value, "admin");
+  });
+
+  it("extracts < operator", async () => {
+    await setup();
+    await engine.query("SELECT * FROM users WHERE role < 'z'");
+    assert.ok(lastCtx);
+    assert.equal(lastCtx.quals[0].operator, "<");
+    assert.equal(lastCtx.quals[0].value, "z");
+  });
+
+  it("extracts IN operator", async () => {
+    await setup();
+    await engine.query("SELECT * FROM users WHERE role IN ('admin', 'user')");
+    assert.ok(lastCtx);
+    assert.equal(lastCtx.quals[0].operator, "IN");
+    assert.deepEqual(lastCtx.quals[0].value, ["admin", "user"]);
+  });
+
+  it("extracts NOT IN operator", async () => {
+    await setup();
+    await engine.query("SELECT * FROM users WHERE role NOT IN ('guest')");
+    assert.ok(lastCtx);
+    assert.equal(lastCtx.quals[0].operator, "NOT IN");
+    assert.deepEqual(lastCtx.quals[0].value, ["guest"]);
+  });
+
+  it("extracts BETWEEN operator", async () => {
+    await setup();
+    await engine.query("SELECT * FROM users WHERE role BETWEEN 'a' AND 'z'");
+    assert.ok(lastCtx);
+    assert.equal(lastCtx.quals[0].operator, "BETWEEN");
+    assert.deepEqual(lastCtx.quals[0].value, ["a", "z"]);
+  });
+
+  it("extracts IS NULL operator", async () => {
+    await setup();
+    await engine.query("SELECT * FROM users WHERE role IS NULL");
+    assert.ok(lastCtx);
+    assert.equal(lastCtx.quals[0].operator, "IS NULL");
+    assert.equal(lastCtx.quals[0].value, null);
+  });
+
+  it("extracts IS NOT NULL operator", async () => {
+    await setup();
+    await engine.query("SELECT * FROM users WHERE role IS NOT NULL");
+    assert.ok(lastCtx);
+    assert.equal(lastCtx.quals[0].operator, "IS NOT NULL");
+    assert.equal(lastCtx.quals[0].value, null);
+  });
+
+  it("extracts LIKE operator", async () => {
+    await setup();
+    await engine.query("SELECT * FROM users WHERE role LIKE '%admin%'");
+    assert.ok(lastCtx);
+    assert.equal(lastCtx.quals[0].operator, "LIKE");
+    assert.equal(lastCtx.quals[0].value, "%admin%");
+  });
+
+  it("extracts ILIKE operator", async () => {
+    await setup();
+    await engine.query("SELECT * FROM users WHERE role ILIKE '%admin%'");
+    assert.ok(lastCtx);
+    assert.equal(lastCtx.quals[0].operator, "ILIKE");
+    assert.equal(lastCtx.quals[0].value, "%admin%");
+  });
+
+  it("extracts key column quals alongside non-key WHERE clauses", async () => {
+    await setup();
+    await engine.query(
+      "SELECT * FROM users WHERE role = 'admin' AND name = 'Alice'",
+    );
+    assert.ok(lastCtx);
+    const roleQual = lastCtx.quals.find((q: any) => q.column === "role");
+    assert.ok(roleQual);
+    assert.equal(roleQual.operator, "=");
+    assert.equal(roleQual.value, "admin");
+    // name is not a key column, so it shouldn't be in quals
+    const nameQual = lastCtx.quals.find((q: any) => q.column === "name");
+    assert.equal(nameQual, undefined);
+  });
+
   it("non-key WHERE filtered by DuckDB", async () => {
     await setup();
     const rows = await engine.query("SELECT * FROM users WHERE name = 'Alice'");
