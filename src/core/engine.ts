@@ -111,15 +111,27 @@ export class QueryEngine {
   private extractQuals(sql: string, keyColNames: string[]): Qual[] {
     const quals: Qual[] = [];
     for (const col of keyColNames) {
-      const patterns = [
-        new RegExp(`${col}\\s*=\\s*'([^']*)'`, "i"),
-        new RegExp(`${col}\\s*=\\s*"([^"]*)"`, "i"),
-        new RegExp(`${col}\\s*=\\s*(\\d+)`, "i"),
+      const patterns: [RegExp, (m: RegExpMatchArray) => string][] = [
+        // Single-quoted strings: handle '' escaped quotes
+        [
+          new RegExp(`${col}\\s*=\\s*'((?:[^']|'')*)'`, "i"),
+          (m) => m[1].replace(/''/g, "'"),
+        ],
+        // Double-quoted strings
+        [
+          new RegExp(`${col}\\s*=\\s*"((?:[^"]|\\\\")*)"`, "i"),
+          (m) => m[1].replace(/\\\\"/g, '"'),
+        ],
+        // Numeric values
+        [
+          new RegExp(`${col}\\s*=\\s*(\\d+)`, "i"),
+          (m) => m[1],
+        ],
       ];
-      for (const p of patterns) {
-        const m = sql.match(p);
+      for (const [pattern, extract] of patterns) {
+        const m = sql.match(pattern);
         if (m) {
-          quals.push({ column: col, operator: "=", value: m[1] });
+          quals.push({ column: col, operator: "=", value: extract(m) });
           break;
         }
       }

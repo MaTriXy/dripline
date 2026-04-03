@@ -98,6 +98,28 @@ describe("QueryEngine", () => {
     assert.equal(lastCtx.quals[0].value, "admin");
   });
 
+  it("key column qual with escaped single quotes", async () => {
+    await setup();
+    await engine.query(
+      "SELECT * FROM users WHERE role = 'it''s admin'",
+    );
+    assert.ok(lastCtx);
+    assert.equal(lastCtx.quals[0].column, "role");
+    assert.equal(lastCtx.quals[0].value, "it's admin");
+  });
+
+  it("key column qual with SQL containing quotes", async () => {
+    await setup();
+    await engine.query(
+      "SELECT * FROM users WHERE role = 'SELECT * WHERE x >= ''2026-01-01'''",
+    );
+    assert.ok(lastCtx);
+    assert.equal(
+      lastCtx.quals[0].value,
+      "SELECT * WHERE x >= '2026-01-01'",
+    );
+  });
+
   it("non-key WHERE filtered by DuckDB", async () => {
     await setup();
     const rows = await engine.query("SELECT * FROM users WHERE name = 'Alice'");
