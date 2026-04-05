@@ -355,7 +355,7 @@ export class QueryEngine {
         }
       }
       if (!usedGet) {
-        for (const row of table.list(ctx)) {
+        for await (const row of table.list(ctx)) {
           rows.push(row);
         }
       }
@@ -786,7 +786,7 @@ export class QueryEngine {
     // Collect rows from plugin
     this.rateLimiter.acquireSync(pluginName);
     const rows: Record<string, any>[] = [];
-    for (const row of table.list(ctx)) {
+    for await (const row of table.list(ctx)) {
       rows.push(row);
     }
     this.rateLimiter.release(pluginName);

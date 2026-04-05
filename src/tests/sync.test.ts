@@ -464,6 +464,70 @@ describe("sync() — metadata table", () => {
   });
 });
 
+describe("sync() — async generator plugin", () => {
+  afterEach(cleanup);
+
+  it("works with async *list()", async () => {
+    const plugin: PluginDef = {
+      name: "async_plugin",
+      version: "1.0.0",
+      tables: [
+        {
+          name: "async_items",
+          columns: [
+            { name: "id", type: "number" },
+            { name: "name", type: "string" },
+          ],
+          async *list() {
+            // Simulate async fetch
+            await new Promise((r) => setTimeout(r, 5));
+            yield { id: 1, name: "a" };
+            await new Promise((r) => setTimeout(r, 5));
+            yield { id: 2, name: "b" };
+          },
+        },
+      ],
+    };
+
+    await setup(plugin);
+    const result = await dl.sync();
+    assert.equal(result.tables[0].rowsInserted, 2);
+
+    const rows = await dl.query<{ id: number; name: string }>(
+      'SELECT * FROM "s"."async_items" ORDER BY id',
+    );
+    assert.equal(rows.length, 2);
+    assert.equal(rows[1].name, "b");
+  });
+
+  it("works with async *list() in ephemeral query mode", async () => {
+    const plugin: PluginDef = {
+      name: "async_query",
+      version: "1.0.0",
+      tables: [
+        {
+          name: "aq_items",
+          columns: [
+            { name: "id", type: "number" },
+            { name: "val", type: "string" },
+          ],
+          async *list() {
+            yield { id: 1, val: "x" };
+            yield { id: 2, val: "y" };
+          },
+        },
+      ],
+    };
+
+    dl = await Dripline.create({ plugins: [plugin] });
+    const rows = await dl.query<{ id: number; val: string }>(
+      "SELECT * FROM aq_items ORDER BY id",
+    );
+    assert.equal(rows.length, 2);
+    assert.equal(rows[0].val, "x");
+  });
+});
+
 describe("query() with external DB", () => {
   afterEach(cleanup);
 

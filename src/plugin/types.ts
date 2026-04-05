@@ -34,7 +34,11 @@ export interface QueryContext {
   cursor?: { column: string; value: any } | null;
 }
 
-export type ListFunc = (ctx: QueryContext) => Generator<Record<string, any>>;
+export type ListFunc = (
+  ctx: QueryContext,
+) =>
+  | Generator<Record<string, any>>
+  | AsyncGenerator<Record<string, any>>;
 export type GetFunc = (ctx: QueryContext) => Record<string, any> | null;
 export type HydrateFunc = (
   ctx: QueryContext,
