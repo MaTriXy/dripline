@@ -1,7 +1,9 @@
+import { Database } from "duckdb-async";
 import type { DriplineConfig } from "./config/types.js";
 import { DEFAULT_CONFIG } from "./config/types.js";
 import { QueryCache } from "./core/cache.js";
 import { QueryEngine } from "./core/engine.js";
+import type { SyncResult } from "./core/engine.js";
 import { RateLimiter } from "./core/rate-limiter.js";
 import type { PluginFunction } from "./plugin/api.js";
 import { resolvePluginExport } from "./plugin/api.js";
@@ -21,6 +23,10 @@ export interface DriplineOptions {
   cache?: { enabled?: boolean; ttl?: number; maxSize?: number };
   /** Per-plugin rate limits */
   rateLimits?: Record<string, RateLimitConfig>;
+  /** External DuckDB instance — dripline will not close it. */
+  database?: Database;
+  /** Schema to namespace tables under. Required when database is provided. */
+  schema?: string;
 }
 
 export class Dripline {
@@ -64,7 +70,10 @@ export class Dripline {
     };
 
     this.engine = new QueryEngine(this.registry, this.cache, this.rateLimiter);
-    await this.engine.initialize(config);
+    await this.engine.initialize(config, {
+      database: this.options.database,
+      schema: this.options.schema,
+    });
   }
 
   /** Execute a SQL query and return rows. */
@@ -124,7 +133,18 @@ export class Dripline {
     }));
   }
 
-  /** Close the database. */
+  /**
+   * Sync plugin data into persistent storage.
+   * Pass table names as keys with their required params as values.
+   * Omit to sync all tables.
+   */
+  async sync(
+    params?: Record<string, Record<string, any>>,
+  ): Promise<SyncResult> {
+    return this.engine.sync(params);
+  }
+
+  /** Close the database. Does NOT close an externally-provided database. */
   async close(): Promise<void> {
     await this.engine.close();
   }

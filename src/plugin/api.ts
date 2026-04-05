@@ -19,6 +19,10 @@ export interface SchemaField {
 export interface TableDefinition {
   columns: ColumnDef[];
   keyColumns?: KeyColumn[];
+  /** Row identity columns for deduplication during sync. */
+  primaryKey?: string[];
+  /** Column name used as high-water mark for incremental sync. Type inferred from columns[]. */
+  cursor?: string;
   list: ListFunc;
   get?: GetFunc;
   hydrate?: Record<string, HydrateFunc>;

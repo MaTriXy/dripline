@@ -10,6 +10,7 @@ export type { CacheConfig, DriplineConfig } from "./config/types.js";
 export { DEFAULT_CONFIG } from "./config/types.js";
 export { configureCache, QueryCache, queryCache } from "./core/cache.js";
 export { createEngine, QueryEngine } from "./core/engine.js";
+export type { SyncResult, SyncTableResult } from "./core/engine.js";
 export { RateLimiter, rateLimiter } from "./core/rate-limiter.js";
 export type {
   DriplinePluginAPI,
@@ -51,6 +52,7 @@ export type {
   TableDef,
 } from "./plugin/types.js";
 export { Dripline } from "./sdk.js";
+export type { DriplineOptions } from "./sdk.js";
 export type { ExecOptions, ExecResult, OutputParser } from "./utils/cli.js";
 export { commandExists, syncExec } from "./utils/cli.js";
 export { formatCsv, formatJson, formatLine } from "./utils/formatters.js";

@@ -1,0 +1,486 @@
+import { strict as assert } from "node:assert";
+import { afterEach, describe, it } from "node:test";
+import { Database } from "duckdb-async";
+import type { PluginDef, QueryContext } from "../plugin/types.js";
+import { Dripline } from "../sdk.js";
+
+// ── Helpers ──────────────────────────────────────────────────────────
+
+function makePlugin(opts?: {
+  cursor?: string;
+}): { plugin: PluginDef; calls: () => QueryContext[] } {
+  const captured: QueryContext[] = [];
+  const plugin: PluginDef = {
+    name: "counter",
+    version: "1.0.0",
+    tables: [
+      {
+        name: "items",
+        columns: [
+          { name: "id", type: "number" },
+          { name: "name", type: "string" },
+          { name: "updated_at", type: "datetime" },
+        ],
+        keyColumns: [{ name: "org", required: "required" }],
+        cursor: opts?.cursor,
+        *list(ctx) {
+          captured.push(ctx);
+          const since = ctx.cursor?.value;
+          const all = [
+            { id: 1, name: "a", updated_at: "2024-01-01T00:00:00Z", org: "x" },
+            { id: 2, name: "b", updated_at: "2024-02-01T00:00:00Z", org: "x" },
+            { id: 3, name: "c", updated_at: "2024-03-01T00:00:00Z", org: "x" },
+          ];
+          for (const row of all) {
+            if (since && row.updated_at <= since) continue;
+            yield row;
+          }
+        },
+      },
+    ],
+  };
+  return { plugin, calls: () => captured };
+}
+
+let dl: Dripline;
+let db: Database;
+
+async function setup(plugin: PluginDef, schema = "s") {
+  db = await Database.create(":memory:");
+  dl = await Dripline.create({ plugins: [plugin], database: db, schema });
+}
+
+async function cleanup() {
+  if (dl) { try { await dl.close(); } catch {} dl = null as any; }
+  if (db) { try { await db.close(); } catch {} db = null as any; }
+}
+
+// ── Tests ────────────────────────────────────────────────────────────
+
+describe("sync() — full replace (no cursor)", () => {
+  afterEach(cleanup);
+
+  it("inserts all rows", async () => {
+    const { plugin } = makePlugin();
+    await setup(plugin);
+
+    const result = await dl.sync({ items: { org: "x" } });
+    assert.equal(result.tables.length, 1);
+    assert.equal(result.tables[0].rowsInserted, 3);
+    assert.equal(result.tables[0].rowsTotal, 3);
+    assert.equal(result.errors.length, 0);
+
+    const rows = await dl.query('SELECT * FROM "s"."items" ORDER BY id');
+    assert.equal(rows.length, 3);
+  });
+
+  it("replaces all rows on second sync", async () => {
+    const { plugin } = makePlugin();
+    await setup(plugin);
+
+    await dl.sync({ items: { org: "x" } });
+    await dl.sync({ items: { org: "x" } });
+
+    const rows = await dl.query('SELECT * FROM "s"."items"');
+    assert.equal(rows.length, 3); // not 6
+  });
+});
+
+describe("sync() — incremental with cursor", () => {
+  afterEach(cleanup);
+
+  it("first sync gets all rows, second gets none (cursor filters)", async () => {
+    const { plugin, calls } = makePlugin({ cursor: "updated_at" });
+    await setup(plugin);
+
+    const r1 = await dl.sync({ items: { org: "x" } });
+    assert.equal(r1.tables[0].rowsTotal, 3);
+    assert.equal(calls()[0].cursor, null);
+
+    const r2 = await dl.sync({ items: { org: "x" } });
+    assert.ok(calls()[1].cursor);
+    assert.equal(calls()[1].cursor!.column, "updated_at");
+    assert.equal(calls()[1].cursor!.value, "2024-03-01T00:00:00Z");
+    assert.equal(r2.tables[0].rowsInserted, 0);
+    assert.equal(r2.tables[0].rowsTotal, 3);
+  });
+
+  it("appends new rows on incremental sync", async () => {
+    let callCount = 0;
+    const plugin: PluginDef = {
+      name: "append_test",
+      version: "1.0.0",
+      tables: [
+        {
+          name: "events",
+          columns: [
+            { name: "id", type: "number" },
+            { name: "ts", type: "datetime" },
+          ],
+          cursor: "ts",
+          *list() {
+            callCount++;
+            if (callCount === 1) {
+              yield { id: 1, ts: "2024-01-01" };
+              yield { id: 2, ts: "2024-02-01" };
+            } else {
+              yield { id: 3, ts: "2024-03-01" };
+            }
+          },
+        },
+      ],
+    };
+
+    await setup(plugin);
+    await dl.sync();
+
+    const r2 = await dl.sync();
+    assert.equal(r2.tables[0].rowsInserted, 1);
+    assert.equal(r2.tables[0].rowsTotal, 3);
+
+    const rows = await dl.query<{ id: number }>('SELECT * FROM "s"."events" ORDER BY id');
+    assert.equal(rows.length, 3);
+    assert.equal(rows[2].id, 3);
+  });
+
+  it("engine filters even when plugin yields everything (dumb plugin)", async () => {
+    const plugin: PluginDef = {
+      name: "dumb",
+      version: "1.0.0",
+      tables: [
+        {
+          name: "logs",
+          columns: [
+            { name: "id", type: "number" },
+            { name: "ts", type: "datetime" },
+          ],
+          cursor: "ts",
+          *list() {
+            yield { id: 1, ts: "2024-01-01" };
+            yield { id: 2, ts: "2024-02-01" };
+            yield { id: 3, ts: "2024-03-01" };
+          },
+        },
+      ],
+    };
+
+    await setup(plugin);
+    await dl.sync();
+
+    const r2 = await dl.sync();
+    assert.equal(r2.tables[0].rowsInserted, 0);
+    assert.equal(r2.tables[0].rowsTotal, 3);
+  });
+});
+
+describe("sync() — full replace + dedup (PK, no cursor)", () => {
+  afterEach(cleanup);
+
+  it("deduplicates by primary key on full replace", async () => {
+    const plugin: PluginDef = {
+      name: "dedup_full",
+      version: "1.0.0",
+      tables: [
+        {
+          name: "things",
+          columns: [
+            { name: "id", type: "number" },
+            { name: "val", type: "string" },
+          ],
+          primaryKey: ["id"],
+          *list() {
+            // Source returns dupes
+            yield { id: 1, val: "a" };
+            yield { id: 1, val: "b" }; // dupe — should overwrite
+            yield { id: 2, val: "c" };
+          },
+        },
+      ],
+    };
+
+    await setup(plugin);
+    await dl.sync();
+
+    const rows = await dl.query<{ id: number; val: string }>(
+      'SELECT * FROM "s"."things" ORDER BY id',
+    );
+    assert.equal(rows.length, 2); // deduped — no duplicate id=1 rows
+  });
+});
+
+describe("sync() — incremental append + dedup (cursor + PK)", () => {
+  afterEach(cleanup);
+
+  it("upserts updated rows on incremental sync", async () => {
+    let callCount = 0;
+    const plugin: PluginDef = {
+      name: "upsert_test",
+      version: "1.0.0",
+      tables: [
+        {
+          name: "things",
+          columns: [
+            { name: "id", type: "number" },
+            { name: "val", type: "string" },
+            { name: "updated_at", type: "datetime" },
+          ],
+          primaryKey: ["id"],
+          cursor: "updated_at",
+          *list(ctx) {
+            callCount++;
+            if (callCount === 1) {
+              yield { id: 1, val: "original", updated_at: "2024-01-01" };
+              yield { id: 2, val: "original", updated_at: "2024-01-01" };
+            } else {
+              // id=1 updated, id=3 new
+              yield { id: 1, val: "updated", updated_at: "2024-02-01" };
+              yield { id: 3, val: "new", updated_at: "2024-02-01" };
+            }
+          },
+        },
+      ],
+    };
+
+    await setup(plugin);
+    await dl.sync();
+    await dl.sync();
+
+    const rows = await dl.query<{ id: number; val: string }>(
+      'SELECT * FROM "s"."things" ORDER BY id',
+    );
+    assert.equal(rows.length, 3);
+    assert.equal(rows[0].val, "updated"); // id=1 upserted
+    assert.equal(rows[1].val, "original"); // id=2 unchanged
+    assert.equal(rows[2].val, "new"); // id=3 new
+  });
+
+  it("deduplicates even when dumb plugin yields everything", async () => {
+    const plugin: PluginDef = {
+      name: "dumb_dedup",
+      version: "1.0.0",
+      tables: [
+        {
+          name: "items",
+          columns: [
+            { name: "id", type: "number" },
+            { name: "val", type: "string" },
+            { name: "ts", type: "datetime" },
+          ],
+          primaryKey: ["id"],
+          cursor: "ts",
+          *list() {
+            // Always yields everything — doesn't use cursor
+            yield { id: 1, val: "latest", ts: "2024-01-01" };
+            yield { id: 2, val: "latest", ts: "2024-02-01" };
+          },
+        },
+      ],
+    };
+
+    await setup(plugin);
+    await dl.sync();
+    await dl.sync(); // yields same rows again
+
+    const rows = await dl.query('SELECT * FROM "s"."items"');
+    assert.equal(rows.length, 2); // no dupes thanks to PK dedup
+  });
+});
+
+describe("sync() — external database", () => {
+  afterEach(cleanup);
+
+  it("creates tables in correct schema", async () => {
+    const { plugin } = makePlugin();
+    await setup(plugin, "test_schema");
+
+    await dl.sync({ items: { org: "x" } });
+
+    const rows = await db.all('SELECT * FROM "test_schema"."items" ORDER BY id');
+    assert.equal(rows.length, 3);
+  });
+
+  it("schema isolation — two instances don't interfere", async () => {
+    db = await Database.create(":memory:");
+    const { plugin: p1 } = makePlugin();
+    const { plugin: p2 } = makePlugin();
+
+    const dl1 = await Dripline.create({ plugins: [p1], database: db, schema: "ws_1" });
+    const dl2 = await Dripline.create({ plugins: [p2], database: db, schema: "ws_2" });
+
+    await dl1.sync({ items: { org: "x" } });
+    await dl2.sync({ items: { org: "x" } });
+
+    const rows1 = await db.all('SELECT COUNT(*) as cnt FROM "ws_1"."items"');
+    const rows2 = await db.all('SELECT COUNT(*) as cnt FROM "ws_2"."items"');
+    assert.equal(Number(rows1[0].cnt), 3);
+    assert.equal(Number(rows2[0].cnt), 3);
+
+    await dl1.close();
+    await dl2.close();
+    dl = null as any;
+  });
+
+  it("close() does NOT close the shared database", async () => {
+    db = await Database.create(":memory:");
+    const { plugin } = makePlugin();
+
+    dl = await Dripline.create({ plugins: [plugin], database: db, schema: "s1" });
+    await dl.sync({ items: { org: "x" } });
+    await dl.close();
+    dl = null as any;
+
+    const rows = await db.all('SELECT * FROM "s1"."items"');
+    assert.equal(rows.length, 3);
+  });
+
+  it("requires schema when database is provided", async () => {
+    db = await Database.create(":memory:");
+    const { plugin } = makePlugin();
+
+    await assert.rejects(
+      () => Dripline.create({ plugins: [plugin], database: db }),
+      /schema is required/,
+    );
+  });
+});
+
+describe("sync() — error handling", () => {
+  afterEach(cleanup);
+
+  it("captures error, other tables still sync", async () => {
+    const plugin: PluginDef = {
+      name: "mixed",
+      version: "1.0.0",
+      tables: [
+        {
+          name: "good_table",
+          columns: [{ name: "id", type: "number" }],
+          *list() { yield { id: 1 }; },
+        },
+        {
+          name: "bad_table",
+          columns: [{ name: "id", type: "number" }],
+          *list() { throw new Error("api down"); },
+        },
+      ],
+    };
+
+    await setup(plugin);
+    const result = await dl.sync();
+
+    assert.equal(result.tables.length, 1);
+    assert.equal(result.tables[0].table, "good_table");
+    assert.equal(result.errors.length, 1);
+    assert.equal(result.errors[0].table, "bad_table");
+    assert.ok(result.errors[0].error.includes("api down"));
+  });
+
+  it("captures missing required keyColumn params as error", async () => {
+    const { plugin } = makePlugin();
+    await setup(plugin);
+
+    const result = await dl.sync({ items: {} });
+    assert.equal(result.errors.length, 1);
+    assert.ok(result.errors[0].error.includes('requires "org"'));
+  });
+
+  it("throws on unknown table name", async () => {
+    const { plugin } = makePlugin();
+    await setup(plugin);
+
+    await assert.rejects(() => dl.sync({ nope: {} }), /Unknown table "nope"/);
+  });
+
+  it("throws when called without external database", async () => {
+    const { plugin } = makePlugin();
+    dl = await Dripline.create({ plugins: [plugin] });
+
+    await assert.rejects(() => dl.sync(), /requires an external database/);
+  });
+});
+
+describe("sync() — cursor scoped to params", () => {
+  afterEach(cleanup);
+
+  it("different params get independent cursors", async () => {
+    let calls: Array<{ org: string; cursor: any }> = [];
+    const plugin: PluginDef = {
+      name: "scoped",
+      version: "1.0.0",
+      tables: [
+        {
+          name: "items",
+          columns: [
+            { name: "id", type: "number" },
+            { name: "ts", type: "datetime" },
+          ],
+          keyColumns: [{ name: "org", required: "required" }],
+          cursor: "ts",
+          *list(ctx) {
+            const org = ctx.quals.find((q) => q.column === "org")?.value;
+            calls.push({ org, cursor: ctx.cursor });
+            if (org === "a") {
+              yield { id: 1, ts: "2024-01-01", org: "a" };
+            } else {
+              yield { id: 2, ts: "2024-06-01", org: "b" };
+            }
+          },
+        },
+      ],
+    };
+
+    await setup(plugin);
+
+    // Sync org=a, then org=b
+    await dl.sync({ items: { org: "a" } });
+    await dl.sync({ items: { org: "b" } });
+
+    // Sync both again — each should have its own cursor
+    calls = [];
+    await dl.sync({ items: { org: "a" } });
+    await dl.sync({ items: { org: "b" } });
+
+    // org=a cursor should be 2024-01-01, org=b should be 2024-06-01
+    assert.equal(calls[0].cursor?.value, "2024-01-01");
+    assert.equal(calls[1].cursor?.value, "2024-06-01");
+  });
+});
+
+describe("sync() — metadata table", () => {
+  afterEach(cleanup);
+
+  it("creates and updates _dripline_sync rows", async () => {
+    const { plugin } = makePlugin({ cursor: "updated_at" });
+    await setup(plugin);
+
+    await dl.sync({ items: { org: "x" } });
+
+    const meta = await db.all('SELECT * FROM "s"."_dripline_sync"');
+    assert.equal(meta.length, 1);
+    assert.equal(meta[0].table_name, "items");
+    assert.equal(meta[0].plugin, "counter");
+    assert.equal(meta[0].status, "ok");
+    assert.equal(JSON.parse(meta[0].last_cursor), "2024-03-01T00:00:00Z");
+  });
+});
+
+describe("query() with external DB", () => {
+  afterEach(cleanup);
+
+  it("reads synced data without re-materializing", async () => {
+    const { plugin } = makePlugin();
+    await setup(plugin);
+
+    await dl.sync({ items: { org: "x" } });
+    const rows = await dl.query('SELECT * FROM "s"."items" ORDER BY id');
+    assert.equal(rows.length, 3);
+  });
+
+  it("query before sync returns empty (no auto-materialize)", async () => {
+    const { plugin } = makePlugin();
+    await setup(plugin);
+
+    const rows = await dl.query('SELECT * FROM "s"."items"');
+    assert.equal(rows.length, 0);
+  });
+});

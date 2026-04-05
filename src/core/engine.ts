@@ -22,8 +22,31 @@ interface RegisteredTable {
   allColumns: string[];
 }
 
+export interface SyncTableResult {
+  table: string;
+  plugin: string;
+  rowsInserted: number;
+  rowsTotal: number;
+  cursor?: any;
+  durationMs: number;
+}
+
+export interface SyncResult {
+  tables: SyncTableResult[];
+  errors: Array<{ table: string; plugin: string; error: string }>;
+}
+
+export interface EngineOptions {
+  /** External DuckDB instance — engine will not close it. */
+  database?: Database;
+  /** Schema to namespace all tables under. Required when database is provided. */
+  schema?: string;
+}
+
 export class QueryEngine {
   private db!: Database;
+  private ownsDb = true;
+  private dbSchema?: string;
   private registry: PluginRegistry;
   private cache: QueryCache;
   private rateLimiter: RateLimiter;
@@ -39,8 +62,31 @@ export class QueryEngine {
     this.rateLimiter = rateLimiter;
   }
 
-  async initialize(config: DriplineConfig): Promise<void> {
-    this.db = await Database.create(":memory:");
+  /** Qualify a table name with schema if configured. */
+  private qualifiedName(tableName: string): string {
+    return this.dbSchema
+      ? `"${this.dbSchema}"."${tableName}"`
+      : `"${tableName}"`;
+  }
+
+  async initialize(
+    config: DriplineConfig,
+    options?: EngineOptions,
+  ): Promise<void> {
+    if (options?.database) {
+      if (!options.schema) {
+        throw new Error(
+          "schema is required when providing an external database",
+        );
+      }
+      this.db = options.database;
+      this.ownsDb = false;
+      this.dbSchema = options.schema;
+      await this.db.exec(`CREATE SCHEMA IF NOT EXISTS "${options.schema}"`);
+    } else {
+      this.db = await Database.create(":memory:");
+      this.dbSchema = options?.schema;
+    }
     await this.db.exec("INSTALL arrow FROM community; LOAD arrow;");
 
     for (const [scope, rl] of Object.entries(config.rateLimits)) {
@@ -75,7 +121,9 @@ export class QueryEngine {
       return `"${name}" ${duckType}`;
     });
 
-    await this.db.run(`CREATE TABLE "${table.name}" (${colDefs.join(", ")})`);
+    await this.db.run(
+      `CREATE TABLE IF NOT EXISTS ${this.qualifiedName(table.name)} (${colDefs.join(", ")})`,
+    );
 
     this.tables.set(table.name, {
       pluginName,
@@ -84,6 +132,7 @@ export class QueryEngine {
       schema,
       keyColNames,
       allColumns: uniqueColumns,
+
     });
   }
 
@@ -269,6 +318,10 @@ export class QueryEngine {
     reg: RegisteredTable,
     quals: Qual[],
   ): Promise<void> {
+    // External DB mode: query() reads what's there, sync() writes.
+    // No ephemeral materialization — the caller manages freshness.
+    if (!this.ownsDb) return;
+
     const { table, pluginName } = reg;
     const visibleColumns = table.columns.map((c) => c.name);
 
@@ -331,35 +384,9 @@ export class QueryEngine {
     rows: Record<string, any>[],
     quals: Qual[],
   ): Promise<void> {
-    await this.db.run(`DELETE FROM "${table.name}"`);
-
+    await this.db.run(`DELETE FROM ${this.qualifiedName(table.name)}`);
     if (rows.length === 0) return;
-
-    const colTypes = new Map(table.columns.map((c) => [c.name, c.type]));
-    const qualMap = Object.fromEntries(quals.map((q) => [q.column, q.value]));
-
-    const arrowCols: Record<string, arrow.Vector> = {};
-    for (const col of reg.allColumns) {
-      const values = rows.map((row) => {
-        const v = row[col] ?? qualMap[col];
-        if (v == null) return null;
-        return typeof v === "object" ? JSON.stringify(v) : v;
-      });
-      const colType = colTypes.get(col) ?? "string";
-      // DuckDB's Arrow scanner crashes on all-null Bool buffers (0-byte data buffer).
-      // Fall back to Utf8 — DuckDB casts NULL varchar to NULL boolean on INSERT.
-      const allNull = colType === "boolean" && values.every((v) => v == null);
-      arrowCols[col] = arrow.vectorFromArray(
-        values,
-        allNull ? new arrow.Utf8() : toArrowType(colType),
-      );
-    }
-
-    const ipc = arrow.tableToIPC(new arrow.Table(arrowCols), "stream");
-    const buf = `_dripline_buf_${table.name}`;
-    await this.db.register_buffer(buf, [ipc], true);
-    await this.db.run(`INSERT INTO "${table.name}" SELECT * FROM ${buf}`);
-    await this.db.unregister_buffer(buf);
+    await this.ingestViaArrowInto(reg, table, rows, quals, this.qualifiedName(table.name), table.name);
   }
 
   async query(sql: string, params?: any[]): Promise<any[]> {
@@ -594,12 +621,330 @@ export class QueryEngine {
     return result[0].sql;
   }
 
+  /** Sync tables from plugins into persistent storage. */
+  async sync(
+    syncParams?: Record<string, Record<string, any>>,
+  ): Promise<SyncResult> {
+    if (this.ownsDb) {
+      throw new Error(
+        "sync() requires an external database. Pass { database, schema } to Dripline.create().",
+      );
+    }
+
+    const tablesToSync: Array<[string, RegisteredTable]> = [];
+    if (syncParams) {
+      for (const tableName of Object.keys(syncParams)) {
+        const reg = this.tables.get(tableName);
+        if (!reg) {
+          throw new Error(
+            `Unknown table "${tableName}". Available: ${[...this.tables.keys()].join(", ")}`,
+          );
+        }
+        tablesToSync.push([tableName, reg]);
+      }
+    } else {
+      for (const [name, reg] of this.tables) {
+        tablesToSync.push([name, reg]);
+      }
+    }
+
+    // Ensure sync metadata table exists
+    await this.ensureSyncMetaTable();
+
+    const results: SyncTableResult[] = [];
+    const errors: SyncResult["errors"] = [];
+
+    for (const [tableName, reg] of tablesToSync) {
+      const start = Date.now();
+      const params = syncParams?.[tableName] ?? {};
+      const pk = this.paramsKey(params);
+      try {
+        const result = await this.syncTable(reg, params);
+        results.push(result);
+
+        // Update metadata
+        await this.db.run(
+          `INSERT OR REPLACE INTO ${this.qualifiedName("_dripline_sync")} VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+          tableName,
+          pk,
+          reg.pluginName,
+          result.cursor != null ? JSON.stringify(result.cursor) : null,
+          Date.now(),
+          result.rowsTotal,
+          "ok",
+          null,
+          result.durationMs,
+        );
+      } catch (err: any) {
+        const durationMs = Date.now() - start;
+        errors.push({
+          table: tableName,
+          plugin: reg.pluginName,
+          error: err.message ?? String(err),
+        });
+
+        await this.db.run(
+          `INSERT OR REPLACE INTO ${this.qualifiedName("_dripline_sync")} VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+          tableName,
+          pk,
+          reg.pluginName,
+          null,
+          Date.now(),
+          0,
+          "error",
+          err.message ?? String(err),
+          durationMs,
+        );
+      }
+    }
+
+    return { tables: results, errors };
+  }
+
+  private async ensureSyncMetaTable(): Promise<void> {
+    await this.db.run(`
+      CREATE TABLE IF NOT EXISTS ${this.qualifiedName("_dripline_sync")} (
+        table_name VARCHAR,
+        params_key VARCHAR,
+        plugin VARCHAR,
+        last_cursor VARCHAR,
+        last_sync_at BIGINT,
+        rows_synced BIGINT,
+        status VARCHAR,
+        error VARCHAR,
+        duration_ms BIGINT,
+        PRIMARY KEY (table_name, params_key)
+      )
+    `);
+  }
+
+  /** Stable key from sync params so cursors are scoped per param set. */
+  private paramsKey(params: Record<string, any>): string {
+    const keys = Object.keys(params).sort();
+    if (keys.length === 0) return "_";
+    return keys.map((k) => `${k}=${params[k]}`).join("&");
+  }
+
+  private async syncTable(
+    reg: RegisteredTable,
+    params: Record<string, any>,
+  ): Promise<SyncTableResult> {
+    const start = Date.now();
+    const { table, pluginName } = reg;
+    const qn = this.qualifiedName(table.name);
+
+    // Validate required keyColumns have params
+    for (const kc of table.keyColumns ?? []) {
+      if (kc.required === "required" && !(kc.name in params)) {
+        throw new Error(
+          `"${table.name}" requires "${kc.name}". Pass it to sync(): dl.sync({ ${table.name}: { ${kc.name}: "..." } })`,
+        );
+      }
+    }
+
+    // Build quals from params
+    const quals: Qual[] = Object.entries(params).map(([column, value]) => ({
+      column,
+      operator: "=",
+      value,
+    }));
+
+    // Read cursor from metadata, scoped to this table + params combo.
+    // We store the cursor in _dripline_sync rather than using MAX() on
+    // the table because the same table may hold data from multiple param
+    // sets (e.g. org=a and org=b), each with independent cursors.
+    let cursorValue: any = null;
+    const pk = this.paramsKey(params);
+    if (table.cursor) {
+      if (!table.columns.find((c) => c.name === table.cursor)) {
+        throw new Error(
+          `cursor "${table.cursor}" is not in columns for "${table.name}"`,
+        );
+      }
+      try {
+        const meta = await this.db.all(
+          `SELECT last_cursor FROM ${this.qualifiedName("_dripline_sync")} WHERE table_name = ? AND params_key = ?`,
+          table.name,
+          pk,
+        );
+        if (meta.length > 0 && meta[0].last_cursor != null) {
+          cursorValue = JSON.parse(meta[0].last_cursor);
+        }
+      } catch {
+        // No metadata yet — first sync
+      }
+    }
+
+    // Build context
+    const connection = this.resolveConnection(reg);
+    const visibleColumns = table.columns.map((c) => c.name);
+    const ctx: QueryContext = { connection, quals, columns: visibleColumns };
+    if (table.cursor) {
+      ctx.cursor = cursorValue != null ? { column: table.cursor, value: cursorValue } : null;
+    }
+
+    // Collect rows from plugin
+    this.rateLimiter.acquireSync(pluginName);
+    const rows: Record<string, any>[] = [];
+    for (const row of table.list(ctx)) {
+      rows.push(row);
+    }
+    this.rateLimiter.release(pluginName);
+
+    // New cursor = max cursor value from the rows we're about to insert.
+    // We compute from the filtered rows, not raw plugin output.
+    let newCursor: any = cursorValue;
+
+    // Sync strategy (Airbyte model):
+    //   cursor + PK  → incremental append + dedup
+    //   cursor, no PK → incremental append
+    //   no cursor + PK → full replace + dedup
+    //   no cursor, no PK → full replace
+    const hasCursor = !!table.cursor;
+    const hasPK = table.primaryKey && table.primaryKey.length > 0;
+
+    let rowsToInsert = rows;
+    if (hasCursor && cursorValue != null) {
+      // Engine-side filter: only keep rows strictly newer than the cursor.
+      // Safety net — even if the plugin already filtered, no duplicates.
+      rowsToInsert = rows.filter((row) => {
+        const v = row[table.cursor!];
+        return v != null && v > cursorValue;
+      });
+    }
+
+    if (!hasCursor) {
+      // Full replace: wipe the table first
+      await this.db.run(`DELETE FROM ${qn}`);
+    }
+
+    if (hasPK && rowsToInsert.length > 0) {
+      // Upsert via INSERT ... ON CONFLICT using a unique index on PK columns
+      const pkCols = table.primaryKey!;
+      const pkList = pkCols.map((pk) => `"${pk}"`).join(", ");
+      const idxName = `_dripline_pk_${table.name}`;
+      await this.db.run(
+        `CREATE UNIQUE INDEX IF NOT EXISTS "${idxName}" ON ${qn} (${pkList})`,
+      );
+
+      const nonPkCols = reg.allColumns.filter((c) => !pkCols.includes(c));
+      const updateSet = nonPkCols
+        .map((c) => `"${c}" = EXCLUDED."${c}"`)
+        .join(", ");
+      const allCols = reg.allColumns.map((c) => `"${c}"`).join(", ");
+
+      const colTypes = new Map(table.columns.map((c) => [c.name, c.type]));
+      const qualMap = Object.fromEntries(quals.map((q) => [q.column, q.value]));
+
+      const arrowCols: Record<string, arrow.Vector> = {};
+      for (const col of reg.allColumns) {
+        const values = rowsToInsert.map((row) => {
+          const v = row[col] ?? qualMap[col];
+          if (v == null) return null;
+          return typeof v === "object" ? JSON.stringify(v) : v;
+        });
+        const colType = colTypes.get(col) ?? "string";
+        const allNull = colType === "boolean" && values.every((v) => v == null);
+        arrowCols[col] = arrow.vectorFromArray(
+          values,
+          allNull ? new arrow.Utf8() : toArrowType(colType),
+        );
+      }
+
+      const ipc = arrow.tableToIPC(new arrow.Table(arrowCols), "stream");
+      const buf = `_dripline_buf_upsert_${table.name}`;
+      await this.db.register_buffer(buf, [ipc], true);
+
+      if (nonPkCols.length > 0) {
+        await this.db.run(
+          `INSERT INTO ${qn} (${allCols}) SELECT ${allCols} FROM ${buf}
+           ON CONFLICT (${pkList}) DO UPDATE SET ${updateSet}`,
+        );
+      } else {
+        // All columns are PK — nothing to update, just ignore dupes
+        await this.db.run(
+          `INSERT OR IGNORE INTO ${qn} (${allCols}) SELECT ${allCols} FROM ${buf}`,
+        );
+      }
+
+      await this.db.unregister_buffer(buf);
+    } else if (rowsToInsert.length > 0) {
+      // No PK: straight append
+      await this.ingestViaArrowInto(reg, table, rowsToInsert, quals, qn, table.name);
+    }
+
+    const rowsInserted = rowsToInsert.length;
+
+    // Update cursor from inserted rows
+    if (table.cursor && rowsToInsert.length > 0) {
+      for (const row of rowsToInsert) {
+        const v = row[table.cursor];
+        if (v != null && (newCursor == null || v > newCursor)) {
+          newCursor = v;
+        }
+      }
+    }
+
+    // Read final state from the table
+    const countResult = await this.db.all(`SELECT COUNT(*) as cnt FROM ${qn}`);
+    const rowsTotal = Number(countResult[0]?.cnt ?? 0);
+
+    return {
+      table: table.name,
+      plugin: pluginName,
+      rowsInserted,
+      rowsTotal,
+      cursor: newCursor,
+      durationMs: Date.now() - start,
+    };
+  }
+
+  /** Ingest rows via Arrow IPC into a specific target table. */
+  private async ingestViaArrowInto(
+    reg: RegisteredTable,
+    table: TableDef,
+    rows: Record<string, any>[],
+    quals: Qual[],
+    targetQn: string,
+    bufSuffix: string,
+  ): Promise<void> {
+    if (rows.length === 0) return;
+
+    const colTypes = new Map(table.columns.map((c) => [c.name, c.type]));
+    const qualMap = Object.fromEntries(quals.map((q) => [q.column, q.value]));
+
+    const arrowCols: Record<string, arrow.Vector> = {};
+    for (const col of reg.allColumns) {
+      const values = rows.map((row) => {
+        const v = row[col] ?? qualMap[col];
+        if (v == null) return null;
+        return typeof v === "object" ? JSON.stringify(v) : v;
+      });
+      const colType = colTypes.get(col) ?? "string";
+      // DuckDB's Arrow scanner crashes on all-null Bool buffers (0-byte data buffer).
+      // Fall back to Utf8 — DuckDB casts NULL varchar to NULL boolean on INSERT.
+      const allNull = colType === "boolean" && values.every((v) => v == null);
+      arrowCols[col] = arrow.vectorFromArray(
+        values,
+        allNull ? new arrow.Utf8() : toArrowType(colType),
+      );
+    }
+
+    const ipc = arrow.tableToIPC(new arrow.Table(arrowCols), "stream");
+    const buf = `_dripline_buf_${bufSuffix}`;
+    await this.db.register_buffer(buf, [ipc], true);
+    await this.db.run(`INSERT INTO ${targetQn} SELECT * FROM ${buf}`);
+    await this.db.unregister_buffer(buf);
+  }
+
   getDatabase(): Database {
     return this.db;
   }
 
   async close(): Promise<void> {
-    await this.db.close();
+    if (this.ownsDb) {
+      await this.db.close();
+    }
   }
 }
 

@@ -30,6 +30,8 @@ export interface QueryContext {
   quals: Qual[];
   columns: string[];
   limit?: number;
+  /** High-water mark from previous sync. null on first sync, undefined during query(). */
+  cursor?: { column: string; value: any } | null;
 }
 
 export type ListFunc = (ctx: QueryContext) => Generator<Record<string, any>>;
@@ -43,6 +45,10 @@ export interface TableDef {
   name: string;
   columns: ColumnDef[];
   keyColumns?: KeyColumn[];
+  /** Row identity columns for deduplication during sync. */
+  primaryKey?: string[];
+  /** Column name used as high-water mark for incremental sync. Type inferred from columns[]. */
+  cursor?: string;
   list: ListFunc;
   get?: GetFunc;
   hydrate?: Record<string, HydrateFunc>;
