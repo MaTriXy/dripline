@@ -783,18 +783,6 @@ export class QueryEngine {
       ctx.cursor = cursorValue != null ? { column: table.cursor, value: cursorValue } : null;
     }
 
-    // Collect rows from plugin
-    this.rateLimiter.acquireSync(pluginName);
-    const rows: Record<string, any>[] = [];
-    for await (const row of table.list(ctx)) {
-      rows.push(row);
-    }
-    this.rateLimiter.release(pluginName);
-
-    // New cursor = max cursor value from the rows we're about to insert.
-    // We compute from the filtered rows, not raw plugin output.
-    let newCursor: any = cursorValue;
-
     // Sync strategy (Airbyte model):
     //   cursor + PK  → incremental append + dedup
     //   cursor, no PK → incremental append
@@ -803,87 +791,60 @@ export class QueryEngine {
     const hasCursor = !!table.cursor;
     const hasPK = table.primaryKey && table.primaryKey.length > 0;
 
-    let rowsToInsert = rows;
-    if (hasCursor && cursorValue != null) {
-      // Engine-side filter: only keep rows strictly newer than the cursor.
-      // Safety net — even if the plugin already filtered, no duplicates.
-      rowsToInsert = rows.filter((row) => {
-        const v = row[table.cursor!];
-        return v != null && v > cursorValue;
-      });
-    }
-
     if (!hasCursor) {
-      // Full replace: wipe the table first
       await this.db.run(`DELETE FROM ${qn}`);
     }
 
-    if (hasPK && rowsToInsert.length > 0) {
-      // Upsert via INSERT ... ON CONFLICT using a unique index on PK columns
-      const pkCols = table.primaryKey!;
-      const pkList = pkCols.map((pk) => `"${pk}"`).join(", ");
+    // Set up upsert index if needed
+    if (hasPK) {
+      const pkList = table.primaryKey!.map((pk) => `"${pk}"`).join(", ");
       const idxName = `_dripline_pk_${table.name}`;
       await this.db.run(
         `CREATE UNIQUE INDEX IF NOT EXISTS "${idxName}" ON ${qn} (${pkList})`,
       );
-
-      const nonPkCols = reg.allColumns.filter((c) => !pkCols.includes(c));
-      const updateSet = nonPkCols
-        .map((c) => `"${c}" = EXCLUDED."${c}"`)
-        .join(", ");
-      const allCols = reg.allColumns.map((c) => `"${c}"`).join(", ");
-
-      const colTypes = new Map(table.columns.map((c) => [c.name, c.type]));
-      const qualMap = Object.fromEntries(quals.map((q) => [q.column, q.value]));
-
-      const arrowCols: Record<string, arrow.Vector> = {};
-      for (const col of reg.allColumns) {
-        const values = rowsToInsert.map((row) => {
-          const v = row[col] ?? qualMap[col];
-          if (v == null) return null;
-          return typeof v === "object" ? JSON.stringify(v) : v;
-        });
-        const colType = colTypes.get(col) ?? "string";
-        const allNull = colType === "boolean" && values.every((v) => v == null);
-        arrowCols[col] = arrow.vectorFromArray(
-          values,
-          allNull ? new arrow.Utf8() : toArrowType(colType),
-        );
-      }
-
-      const ipc = arrow.tableToIPC(new arrow.Table(arrowCols), "stream");
-      const buf = `_dripline_buf_upsert_${table.name}`;
-      await this.db.register_buffer(buf, [ipc], true);
-
-      if (nonPkCols.length > 0) {
-        await this.db.run(
-          `INSERT INTO ${qn} (${allCols}) SELECT ${allCols} FROM ${buf}
-           ON CONFLICT (${pkList}) DO UPDATE SET ${updateSet}`,
-        );
-      } else {
-        // All columns are PK — nothing to update, just ignore dupes
-        await this.db.run(
-          `INSERT OR IGNORE INTO ${qn} (${allCols}) SELECT ${allCols} FROM ${buf}`,
-        );
-      }
-
-      await this.db.unregister_buffer(buf);
-    } else if (rowsToInsert.length > 0) {
-      // No PK: straight append
-      await this.ingestViaArrowInto(reg, table, rowsToInsert, quals, qn, table.name);
     }
 
-    const rowsInserted = rowsToInsert.length;
+    // Stream rows from plugin in batches. Memory capped at BATCH_SIZE rows
+    // regardless of total dataset size.
+    const BATCH_SIZE = 10_000;
+    let newCursor: any = cursorValue;
+    let rowsInserted = 0;
+    let batch: Record<string, any>[] = [];
 
-    // Update cursor from inserted rows
-    if (table.cursor && rowsToInsert.length > 0) {
-      for (const row of rowsToInsert) {
+    const flushBatch = async () => {
+      if (batch.length === 0) return;
+      if (hasPK) {
+        await this.upsertViaArrow(reg, table, batch, quals, qn);
+      } else {
+        await this.ingestViaArrowInto(reg, table, batch, quals, qn, table.name);
+      }
+      rowsInserted += batch.length;
+      batch = [];
+    };
+
+    this.rateLimiter.acquireSync(pluginName);
+    for await (const row of table.list(ctx)) {
+      // Engine-side cursor filter: skip rows not newer than the high-water mark
+      if (hasCursor && cursorValue != null) {
+        const v = row[table.cursor!];
+        if (v == null || v <= cursorValue) continue;
+      }
+
+      // Track high-water mark
+      if (table.cursor) {
         const v = row[table.cursor];
         if (v != null && (newCursor == null || v > newCursor)) {
           newCursor = v;
         }
       }
+
+      batch.push(row);
+      if (batch.length >= BATCH_SIZE) {
+        await flushBatch();
+      }
     }
+    await flushBatch();
+    this.rateLimiter.release(pluginName);
 
     // Read final state from the table
     const countResult = await this.db.all(`SELECT COUNT(*) as cnt FROM ${qn}`);
@@ -897,6 +858,60 @@ export class QueryEngine {
       cursor: newCursor,
       durationMs: Date.now() - start,
     };
+  }
+
+  /** Upsert rows via Arrow IPC using INSERT ... ON CONFLICT. */
+  private async upsertViaArrow(
+    reg: RegisteredTable,
+    table: TableDef,
+    rows: Record<string, any>[],
+    quals: Qual[],
+    targetQn: string,
+  ): Promise<void> {
+    if (rows.length === 0) return;
+
+    const pkCols = table.primaryKey!;
+    const pkList = pkCols.map((pk) => `"${pk}"`).join(", ");
+    const nonPkCols = reg.allColumns.filter((c) => !pkCols.includes(c));
+    const allCols = reg.allColumns.map((c) => `"${c}"`).join(", ");
+
+    const colTypes = new Map(table.columns.map((c) => [c.name, c.type]));
+    const qualMap = Object.fromEntries(quals.map((q) => [q.column, q.value]));
+
+    const arrowCols: Record<string, arrow.Vector> = {};
+    for (const col of reg.allColumns) {
+      const values = rows.map((row) => {
+        const v = row[col] ?? qualMap[col];
+        if (v == null) return null;
+        return typeof v === "object" ? JSON.stringify(v) : v;
+      });
+      const colType = colTypes.get(col) ?? "string";
+      const allNull = colType === "boolean" && values.every((v) => v == null);
+      arrowCols[col] = arrow.vectorFromArray(
+        values,
+        allNull ? new arrow.Utf8() : toArrowType(colType),
+      );
+    }
+
+    const ipc = arrow.tableToIPC(new arrow.Table(arrowCols), "stream");
+    const buf = `_dripline_buf_upsert_${table.name}`;
+    await this.db.register_buffer(buf, [ipc], true);
+
+    if (nonPkCols.length > 0) {
+      const updateSet = nonPkCols
+        .map((c) => `"${c}" = EXCLUDED."${c}"`)
+        .join(", ");
+      await this.db.run(
+        `INSERT INTO ${targetQn} (${allCols}) SELECT ${allCols} FROM ${buf}
+         ON CONFLICT (${pkList}) DO UPDATE SET ${updateSet}`,
+      );
+    } else {
+      await this.db.run(
+        `INSERT OR IGNORE INTO ${targetQn} (${allCols}) SELECT ${allCols} FROM ${buf}`,
+      );
+    }
+
+    await this.db.unregister_buffer(buf);
   }
 
   /** Ingest rows via Arrow IPC into a specific target table. */

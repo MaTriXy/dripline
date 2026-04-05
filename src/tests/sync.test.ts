@@ -464,6 +464,93 @@ describe("sync() — metadata table", () => {
   });
 });
 
+describe("sync() — batched ingestion", () => {
+  afterEach(cleanup);
+
+  it("handles more rows than batch size", async () => {
+    const ROW_COUNT = 25_000; // 2.5 batches at 10k batch size
+    const plugin: PluginDef = {
+      name: "big",
+      version: "1.0.0",
+      tables: [
+        {
+          name: "big_table",
+          columns: [
+            { name: "id", type: "number" },
+            { name: "val", type: "string" },
+          ],
+          *list() {
+            for (let i = 0; i < ROW_COUNT; i++) {
+              yield { id: i, val: `row-${i}` };
+            }
+          },
+        },
+      ],
+    };
+
+    await setup(plugin);
+    const result = await dl.sync();
+    assert.equal(result.tables[0].rowsInserted, ROW_COUNT);
+    assert.equal(result.tables[0].rowsTotal, ROW_COUNT);
+
+    const rows = await dl.query<{ cnt: number }>(
+      'SELECT COUNT(*) as cnt FROM "s"."big_table"',
+    );
+    assert.equal(rows[0].cnt, ROW_COUNT);
+  });
+
+  it("batched upsert with cursor + primaryKey", async () => {
+    let callCount = 0;
+    const plugin: PluginDef = {
+      name: "batch_upsert",
+      version: "1.0.0",
+      tables: [
+        {
+          name: "batch_items",
+          columns: [
+            { name: "id", type: "number" },
+            { name: "val", type: "string" },
+            { name: "ts", type: "datetime" },
+          ],
+          primaryKey: ["id"],
+          cursor: "ts",
+          *list() {
+            callCount++;
+            if (callCount === 1) {
+              for (let i = 0; i < 15_000; i++) {
+                yield { id: i, val: "v1", ts: "2024-01-01" };
+              }
+            } else {
+              // Update first 5k, add 5k new
+              for (let i = 0; i < 5_000; i++) {
+                yield { id: i, val: "v2", ts: "2024-02-01" };
+              }
+              for (let i = 15_000; i < 20_000; i++) {
+                yield { id: i, val: "v2", ts: "2024-02-01" };
+              }
+            }
+          },
+        },
+      ],
+    };
+
+    await setup(plugin);
+    await dl.sync();
+    await dl.sync();
+
+    const rows = await dl.query<{ cnt: number }>(
+      'SELECT COUNT(*) as cnt FROM "s"."batch_items"',
+    );
+    assert.equal(rows[0].cnt, 20_000); // 15k original + 5k new
+
+    // Verify upserted rows have new value
+    const updated = await dl.query<{ cnt: number }>(
+      'SELECT COUNT(*) as cnt FROM "s"."batch_items" WHERE val = \'v2\'',
+    );
+    assert.equal(updated[0].cnt, 10_000); // 5k updated + 5k new
+  });
+});
+
 describe("sync() — async generator plugin", () => {
   afterEach(cleanup);
 
